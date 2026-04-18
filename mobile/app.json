@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "Perp UPSC",
+    "slug": "perp-upsc-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "bundleIdentifier": "com.perp.upsc",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.perp.upsc"
+    }
+  }
+}

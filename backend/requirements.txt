@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+google-genai
+apscheduler
+pydantic
+email-validator
+cachetools
