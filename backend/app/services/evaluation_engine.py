@@ -20,6 +20,8 @@ from app.utils.common import new_id, sha256_json, sha256_text, stable_json_dumps
 
 
 class EvaluationEngine:
+    """UPSC topic-aware evaluation flow with deterministic replay support."""
+
     @staticmethod
     def _concept_universe_from_model_answer(model_answer: dict) -> list[dict[str, str]]:
         concept_universe: list[dict[str, str]] = []
@@ -137,6 +139,25 @@ class EvaluationEngine:
                 reason="empty_or_unreadable",
                 message="We could not derive a readable answer from the submitted text or image.",
             )
+        question_id = sha256_text(question.lower().strip())
+        answer_id = sha256_text(f"{question}|{normalized['cleaned_answer']}")
+        evaluation_cache_key = sha256_text(
+            stable_json_dumps(
+                {
+                    "user_id": user_id,
+                    "topic_id": topic["id"],
+                    "question_id": question_id,
+                    "answer_id": answer_id,
+                    "max_marks": payload["max_marks"],
+                    "calibration_enabled": bool(payload.get("calibration_enabled", True)),
+                    "examiner_mode": str(payload.get("examiner_mode") or "balanced"),
+                    "calibration_seed": payload.get("calibration_seed"),
+                }
+            )
+        )
+        cached_result = cache_service.get_evaluation_result(evaluation_cache_key)
+        if cached_result:
+            return cached_result
 
         model_answer, _ = self._get_model_answer(topic=topic, question=question)
         evaluation_signals = llm_service.analyze_answer_signals(
@@ -171,6 +192,8 @@ class EvaluationEngine:
             calibration_enabled=bool(payload.get("calibration_enabled", True)),
             calibration_mode=str(payload.get("examiner_mode") or "balanced"),
             calibration_seed=payload.get("calibration_seed"),
+            question_id=question_id,
+            answer_id=answer_id,
         )
         guidance = llm_service.generate_evaluation_guidance(
             question=question,
@@ -355,7 +378,7 @@ class EvaluationEngine:
             flashcards = []
             revision = revision_engine.empty_summary()
 
-        return {
+        result = {
             "evaluation": {
                 "score": scoring["final_score"],
                 "scaled_score": scoring["scaled_score"],
@@ -404,6 +427,8 @@ class EvaluationEngine:
             "scoring": scoring,
             "normalized_scoring": normalized_scoring,
         }
+        cache_service.set_evaluation_result(evaluation_cache_key, result)
+        return result
 
 
 evaluation_engine = EvaluationEngine()

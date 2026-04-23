@@ -5,14 +5,17 @@ import json
 from app.config import ROOT_DIR, settings
 from app.database import db
 from app.errors import input_invalid_error
+from app.services.cache_service import cache_service
 from app.schemas import TopicNormalizationPayload
 from app.services.llm_service import llm_service
 from app.services.scoring_engine import scoring_engine
 from app.services.similarity_engine import similarity_engine
-from app.utils.common import new_id, normalize_text, stable_json_dumps, utc_now_iso
+from app.utils.common import new_id, normalize_text, sha256_json, sha256_text, stable_json_dumps, utc_now_iso
 
 
 class AnswerEvaluationEngine:
+    """Strict answer evaluation flow with caching and deterministic scoring."""
+
     @staticmethod
     def _concept_universe_from_model_answer(model_answer: dict) -> list[dict[str, str]]:
         concept_universe: list[dict[str, str]] = []
@@ -246,16 +249,72 @@ class AnswerEvaluationEngine:
         )
         cleaned_answer = normalize_text(normalized_input.get("cleaned_answer", ""))
         if len(cleaned_answer) < 20:
-            raise input_invalid_error(
-                reason="empty_or_unreadable",
-                message="We could not derive a readable answer from the submitted text or image.",
+                raise input_invalid_error(
+                    reason="empty_or_unreadable",
+                    message="We could not derive a readable answer from the submitted text or image.",
+                )
+
+        question_id = sha256_text(question.lower().strip())
+        answer_id = sha256_text(f"{question}|{cleaned_answer}")
+        concept_universe_hash = sha256_json(llm_service._normalize_concept_universe(concept_universe) or [])
+        evaluation_cache_key = sha256_text(
+            stable_json_dumps(
+                {
+                    "user_id": user_id,
+                    "question_id": question_id,
+                    "answer_id": answer_id,
+                    "max_marks": max_marks,
+                    "calibration_enabled": calibration_enabled,
+                    "examiner_mode": examiner_mode,
+                    "calibration_seed": calibration_seed,
+                    "concept_universe_hash": concept_universe_hash,
+                }
             )
+        )
+        cached_evaluation = cache_service.get_evaluation_result(evaluation_cache_key)
+        if cached_evaluation:
+            return cached_evaluation
+
+        history_rows = db.fetch_all(
+            """
+            SELECT evaluation_json, analysis_json, scoring_json, model_answer_json
+            FROM answer_evaluation_history
+            WHERE user_id = ? AND question_text = ? AND cleaned_answer_text = ?
+            ORDER BY created_at DESC
+            LIMIT 5
+            """,
+            [user_id, question, cleaned_answer],
+        )
+        for row in history_rows:
+            scoring_json = self._safe_json_loads(row.get("scoring_json"))
+            cache_meta = scoring_json.get("cache_meta", {}) if isinstance(scoring_json.get("cache_meta"), dict) else {}
+            if cache_meta.get("evaluation_cache_key") != evaluation_cache_key:
+                continue
+            evaluation = self._safe_json_loads(row.get("evaluation_json"))
+            analysis_json = self._safe_json_loads(row.get("analysis_json"))
+            model_answer_json = self._safe_json_loads(row.get("model_answer_json"))
+            result = {
+                "evaluation": evaluation,
+                "analysis": {
+                    "evaluation_signals": analysis_json.get("evaluation_signals", {}),
+                    "merged": analysis_json.get("analysis", {}),
+                    "normalized_scoring": analysis_json.get("normalized_scoring", {}),
+                    "legacy_scoring": scoring_json.get("legacy_scoring", {}),
+                },
+                "cleaned_answer": cleaned_answer,
+                "score": round(float(evaluation.get("score", 0.0) or 0.0), 2),
+                "improvements": list(evaluation.get("improvements", []) or []),
+                "model_answer": model_answer_json,
+                "subscores": evaluation.get("subscores", {}),
+            }
+            cache_service.set_evaluation_result(evaluation_cache_key, result)
+            return result
 
         normalized_topic = self._normalize_question_topic(question)
         topic = self._topic_payload(normalized_topic)
-
-        model_answer = llm_service.generate_model_answer(question=question, topic=topic)
-        effective_concept_universe = llm_service._normalize_concept_universe(concept_universe) or self._concept_universe_from_model_answer(model_answer)
+        model_answer = self._get_model_answer(topic=topic, question=question, question_id=question_id)
+        effective_concept_universe = llm_service._normalize_concept_universe(concept_universe) or cache_service.get_concept_universe(question_id) or self._concept_universe_from_model_answer(model_answer)
+        cache_service.set_concept_universe(question_id, effective_concept_universe)
         evaluation_signals = llm_service.analyze_answer_signals(
             question=question,
             cleaned_answer=cleaned_answer,
@@ -288,6 +347,8 @@ class AnswerEvaluationEngine:
             calibration_enabled=calibration_enabled,
             calibration_mode=examiner_mode,
             calibration_seed=calibration_seed,
+            question_id=question_id,
+            answer_id=answer_id,
         )
         guidance = llm_service.generate_evaluation_guidance(
             question=question,
@@ -362,15 +423,37 @@ class AnswerEvaluationEngine:
                 cleaned_answer,
                 ocr_text,
                 self._input_mode(student_answer=student_answer, ocr_text=ocr_text, image_base64=handwritten_image_base64),
-                stable_json_dumps({"analysis": analysis, "similarity": similarity, "features": features, "normalized_scoring": normalized_scoring}),
-                stable_json_dumps({"legacy_scoring": scoring, "normalized_scoring": normalized_scoring}),
+                stable_json_dumps(
+                    {
+                        "analysis": analysis,
+                        "similarity": similarity,
+                        "features": features,
+                        "evaluation_signals": evaluation_signals,
+                        "normalized_scoring": normalized_scoring,
+                    }
+                ),
+                stable_json_dumps(
+                    {
+                        "legacy_scoring": scoring,
+                        "normalized_scoring": normalized_scoring,
+                        "cache_meta": {
+                            "evaluation_cache_key": evaluation_cache_key,
+                            "question_id": question_id,
+                            "answer_id": answer_id,
+                            "concept_universe_hash": concept_universe_hash,
+                            "calibration_enabled": calibration_enabled,
+                            "examiner_mode": examiner_mode,
+                            "calibration_seed": calibration_seed,
+                        },
+                    }
+                ),
                 stable_json_dumps(evaluation),
                 stable_json_dumps(model_answer),
                 now,
             ],
         )
 
-        return {
+        result = {
             "evaluation": evaluation,
             "analysis": {
                 "evaluation_signals": evaluation_signals,
@@ -384,6 +467,44 @@ class AnswerEvaluationEngine:
             "model_answer": model_answer,
             "subscores": subscores,
         }
+        cache_service.set_evaluation_result(evaluation_cache_key, result)
+        return result
+
+    def _get_model_answer(self, *, topic: dict, question: str, question_id: str) -> dict:
+        """Lock model answer and concept universe per question hash for strict evaluation."""
+        cached = cache_service.get_model_answer(topic["id"], question_id)
+        if cached:
+            return cached
+        row = db.fetch_one("SELECT * FROM model_answers WHERE topic_id = ? AND question_hash = ?", [topic["id"], question_id])
+        if row:
+            payload = self._safe_json_loads(row.get("content_json"))
+            cache_service.set_model_answer(topic["id"], question_id, payload)
+            if payload.get("core_concepts"):
+                cache_service.set_concept_universe(question_id, self._concept_universe_from_model_answer(payload))
+            return payload
+        payload = llm_service.generate_model_answer(question=question, topic=topic)
+        now = utc_now_iso()
+        db.execute(
+            """
+            INSERT OR REPLACE INTO model_answers
+            (id, topic_id, question_hash, question_text, content_json, content_hash, ai_model, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                new_id("model"),
+                topic["id"],
+                question_id,
+                question,
+                stable_json_dumps(payload),
+                sha256_json(payload),
+                "demo" if not llm_service.enabled else "gemini",
+                now,
+                now,
+            ],
+        )
+        cache_service.set_model_answer(topic["id"], question_id, payload)
+        cache_service.set_concept_universe(question_id, self._concept_universe_from_model_answer(payload))
+        return payload
 
 
 answer_evaluation_engine = AnswerEvaluationEngine()

@@ -89,6 +89,10 @@ class ScoringEngine:
         return round(value * 2) / 2
 
     @staticmethod
+    def _round_stage(value: float) -> float:
+        return round(float(value), 4)
+
+    @staticmethod
     def _structure_component_score(value: str, *, body: bool = False) -> float:
         lowered = str(value or "").lower()
         if body:
@@ -98,31 +102,11 @@ class ScoringEngine:
     @staticmethod
     def _stable_variation_seed(
         *,
-        seed: int | None,
-        mode: str,
-        final_score: float,
-        core_depth_ratio: float,
-        core_coverage_ratio: float,
-        directive_coverage_ratio: float,
-        body_structure: str,
-        clarity_score: int,
-        vague_ratio: float,
-        dimension_balance: str,
+        question_id: str,
+        answer_id: str,
+        calibration_seed: int | None,
     ) -> int:
-        payload = "|".join(
-            [
-                str(seed if seed is not None else "auto"),
-                mode,
-                f"{final_score:.6f}",
-                f"{core_depth_ratio:.6f}",
-                f"{core_coverage_ratio:.6f}",
-                f"{directive_coverage_ratio:.6f}",
-                body_structure,
-                str(clarity_score),
-                f"{vague_ratio:.6f}",
-                dimension_balance,
-            ]
-        )
+        payload = repr((question_id, answer_id, calibration_seed))
         return int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16], 16)
 
     def calibrate_signal_score(
@@ -137,13 +121,17 @@ class ScoringEngine:
         vague_ratio: float,
         dimension_balance: str,
         fundamental_weakness: bool,
+        excessive_vagueness_penalty_applied: bool = False,
         mode: str = "balanced",
         enabled: bool = True,
         seed: int | None = None,
+        question_id: str = "",
+        answer_id: str = "",
     ) -> dict:
+        """Apply optional human-like examiner calibration after deterministic scoring."""
         mode_key = str(mode or "balanced").lower()
         profile = EXAMINER_PROFILES.get(mode_key, EXAMINER_PROFILES["balanced"])
-        calibrated_score = clamp(float(final_score or 0.0), 0.0, 1.0)
+        calibrated_score = self._round_stage(clamp(float(final_score or 0.0), 0.0, 1.0))
         applied_adjustments: list[str] = []
         working_vague_ratio = float(vague_ratio or 0.0)
         body_structure = str((structure or {}).get("body") or "unstructured").lower()
@@ -151,10 +139,11 @@ class ScoringEngine:
         if not enabled:
             logger.debug("Signal score calibration disabled. Returning base final_score=%.3f", calibrated_score)
             return {
-                "calibrated_score": round(calibrated_score, 3),
+                "calibrated_score": round(calibrated_score, 4),
                 "applied_profile": mode_key,
                 "applied_adjustments": applied_adjustments,
                 "variation": 0.0,
+                "calibration_seed_used": None,
                 "enabled": False,
             }
 
@@ -169,54 +158,60 @@ class ScoringEngine:
             working_vague_ratio = round(working_vague_ratio * 0.8, 3)
             applied_adjustments.append("consistency_correction")
 
+        total_bonus = 0.0
         if body_structure == "structured" and int(clarity_score or 0) >= 4:
-            calibrated_score += 0.03
+            total_bonus += 0.03
             applied_adjustments.append("presentation_boost")
 
         if str(dimension_balance or "").lower() == "good" and float(core_depth_ratio or 0.0) > 0.5:
-            calibrated_score += 0.03
+            total_bonus += 0.03
             applied_adjustments.append("balance_bonus")
+        total_bonus = min(0.05, total_bonus) * float(profile["bonus_multiplier"])
+        calibrated_score = self._round_stage(calibrated_score + total_bonus)
 
         if working_vague_ratio > 0.4 and float(core_depth_ratio or 0.0) < 0.4:
-            calibrated_score -= 0.05
+            bluff_penalty = 0.05
+            if excessive_vagueness_penalty_applied:
+                bluff_penalty *= 0.5
+            bluff_penalty *= float(profile["penalty_multiplier"])
+            calibrated_score = self._round_stage(calibrated_score - bluff_penalty)
             applied_adjustments.append("bluff_penalty")
 
-        calibrated_score *= float(profile["leniency"])
+        calibrated_score = self._round_stage(calibrated_score * float(profile["leniency"]))
         applied_adjustments.append("profile_adjustment")
 
         if fundamental_weakness:
             variation = 0.0
+            stable_seed = None
         else:
             stable_seed = self._stable_variation_seed(
-                seed=seed,
-                mode=mode_key,
-                final_score=calibrated_score,
-                core_depth_ratio=core_depth_ratio,
-                core_coverage_ratio=core_coverage_ratio,
-                directive_coverage_ratio=directive_coverage_ratio,
-                body_structure=body_structure,
-                clarity_score=clarity_score,
-                vague_ratio=working_vague_ratio,
-                dimension_balance=str(dimension_balance or ""),
+                question_id=question_id or "question_unknown",
+                answer_id=answer_id or "answer_unknown",
+                calibration_seed=seed,
             )
-            variation = random.Random(stable_seed).uniform(-0.02, 0.02)
-        calibrated_score += variation
+            variation = clamp(random.Random(stable_seed).gauss(0, 0.01), -0.02, 0.02)
+        calibrated_score = self._round_stage(calibrated_score + variation)
         applied_adjustments.append("variation")
+        if fundamental_weakness:
+            calibrated_score = self._round_stage(min(calibrated_score, 0.45))
+            applied_adjustments.append("fundamental_weakness_cap")
 
-        calibrated_score = round(clamp(calibrated_score, 0.0, 1.0), 3)
+        calibrated_score = round(clamp(calibrated_score, 0.0, 1.0), 4)
         logger.debug(
-            "Calibration final: calibrated_score=%.3f mode=%s variation=%.4f working_vague_ratio=%.3f adjustments=%s",
+            "Calibration final: calibrated_score=%.4f mode=%s variation=%.4f working_vague_ratio=%.3f adjustments=%s seed=%s",
             calibrated_score,
             mode_key,
             variation,
             working_vague_ratio,
             applied_adjustments,
+            stable_seed,
         )
         return {
             "calibrated_score": calibrated_score,
             "applied_profile": mode_key,
             "applied_adjustments": applied_adjustments,
             "variation": round(variation, 4),
+            "calibration_seed_used": stable_seed,
             "enabled": True,
         }
 
@@ -228,7 +223,11 @@ class ScoringEngine:
         calibration_enabled: bool = False,
         calibration_mode: str = "balanced",
         calibration_seed: int | None = None,
+        question_id: str = "",
+        answer_id: str = "",
     ) -> dict:
+        """Compute the deterministic UPSC-style score from extracted evaluation signals."""
+        signals = signals if isinstance(signals, dict) else {}
         max_marks = max(1, int(max_marks or 10))
         core_coverage_ratio = float(signals.get("core_coverage_ratio", 0.0) or 0.0)
         core_depth_ratio = float(signals.get("core_depth_ratio", 0.0) or 0.0)
@@ -281,6 +280,7 @@ class ScoringEngine:
         logger.debug("Signal scoring raw score before penalties: %.3f", raw_score_before_penalty)
 
         applied_penalties: list[str] = []
+        penalty_seen: set[str] = set()
         base_penalty_map = {
             "missing_conclusion": 0.05,
             "poor_structure": 0.07,
@@ -298,6 +298,9 @@ class ScoringEngine:
             if not isinstance(item, dict):
                 continue
             flag = str(item.get("flag") or item.get("type") or "")
+            if not flag or flag in penalty_seen:
+                continue
+            penalty_seen.add(flag)
             severity = str(item.get("severity") or "").lower()
             if flag in base_penalty_map:
                 penalties_to_apply[flag] = base_penalty_map[flag]
@@ -310,8 +313,8 @@ class ScoringEngine:
         if bool(signals.get("contradiction_present", False)):
             penalties_to_apply["contradiction_present"] = base_penalty_map["contradiction_present"]
 
-        total_penalty = round(min(0.25, sum(penalties_to_apply.values())), 3)
-        penalized_score = clamp(raw_score_before_penalty - total_penalty, 0.0, 1.0)
+        total_penalty = self._round_stage(min(0.25, sum(penalties_to_apply.values())))
+        penalized_score = self._round_stage(clamp(raw_score_before_penalty - total_penalty, 0.0, 1.0))
         for flag, deduction in penalties_to_apply.items():
             applied_penalties.append(f"{flag}:{deduction:.2f}")
         logger.debug(
@@ -333,9 +336,13 @@ class ScoringEngine:
             cap_score = min(cap_score, 0.5)
             applied_caps.append("low_directive_coverage_cap_0.5")
 
-        capped_score = min(penalized_score, cap_score)
+        capped_score = self._round_stage(min(penalized_score, cap_score))
+        logger.debug("Signal scoring caps: cap_score=%.4f capped_score=%.4f applied_caps=%s", cap_score, capped_score, applied_caps)
         extra_bonus = min(0.1, len(signals.get("extra_valid_concepts", []) or []) * 0.02)
-        adjusted_score = capped_score + extra_bonus
+        if core_coverage_ratio < 0.3:
+            extra_bonus *= 0.5
+        extra_bonus = self._round_stage(extra_bonus)
+        adjusted_score = self._round_stage(capped_score + extra_bonus)
         logger.debug(
             "Signal scoring caps and bonus: cap_score=%.3f capped_score=%.3f extra_bonus=%.3f adjusted_pre_confidence=%.3f",
             cap_score,
@@ -345,14 +352,15 @@ class ScoringEngine:
         )
 
         if confidence == "low":
-            adjusted_score *= 0.90
+            adjusted_score = self._round_stage(adjusted_score * 0.90)
             applied_penalties.append("confidence_adjustment_0.90")
         elif confidence == "medium":
-            adjusted_score *= 0.97
+            adjusted_score = self._round_stage(adjusted_score * 0.97)
             applied_penalties.append("confidence_adjustment_0.97")
+        logger.debug("Signal scoring confidence: confidence=%s adjusted_score=%.4f", confidence, adjusted_score)
 
         if core_coverage_ratio > 0.6 and adjusted_score < 0.4 and not fundamental_weakness:
-            adjusted_score = 0.4
+            adjusted_score = self._round_stage(0.4)
             applied_caps.append("core_strength_floor_0.4")
 
         base_final_normalized_score = round(clamp(adjusted_score, 0.0, 1.0), 3)
@@ -366,19 +374,23 @@ class ScoringEngine:
             vague_ratio=vague_ratio,
             dimension_balance=dimension_balance,
             fundamental_weakness=fundamental_weakness,
+            excessive_vagueness_penalty_applied="excessive_vagueness" in penalties_to_apply,
             mode=calibration_mode,
             enabled=calibration_enabled,
             seed=calibration_seed,
+            question_id=question_id,
+            answer_id=answer_id,
         )
         final_normalized_score = float(calibration.get("calibrated_score", base_final_normalized_score))
         adjusted_marks = clamp(final_normalized_score * max_marks, 0.0, float(max_marks))
         estimated_marks = self._nearest_half(adjusted_marks)
         marks_range = [
-            round(estimated_marks - 0.5, 1),
-            round(estimated_marks + 0.5, 1),
+            round(clamp(estimated_marks - 0.5, 0.0, float(max_marks)), 1),
+            round(clamp(estimated_marks + 0.5, 0.0, float(max_marks)), 1),
         ]
         logger.debug(
-            "Signal scoring final: final_normalized_score=%.3f estimated_marks=%.1f marks_range=%s confidence=%s",
+            "Signal scoring final: base_final_normalized_score=%.4f final_normalized_score=%.4f estimated_marks=%.1f marks_range=%s confidence=%s",
+            base_final_normalized_score,
             final_normalized_score,
             estimated_marks,
             marks_range,

@@ -256,6 +256,8 @@ class UPSCUpgradeTestCase(unittest.TestCase):
             calibration_enabled=True,
             calibration_mode="lenient",
             calibration_seed=1234,
+            question_id="q1",
+            answer_id="a1",
         )
         calibrated_two = scoring_engine.score_from_signal_strategy(
             signals=signals,
@@ -263,10 +265,13 @@ class UPSCUpgradeTestCase(unittest.TestCase):
             calibration_enabled=True,
             calibration_mode="lenient",
             calibration_seed=1234,
+            question_id="q1",
+            answer_id="a1",
         )
         self.assertEqual(calibrated_one["final_normalized_score"], calibrated_two["final_normalized_score"])
         self.assertEqual(calibrated_one["estimated_marks"], calibrated_two["estimated_marks"])
         self.assertEqual(calibrated_one["calibration"]["variation"], calibrated_two["calibration"]["variation"])
+        self.assertEqual(calibrated_one["calibration"]["calibration_seed_used"], calibrated_two["calibration"]["calibration_seed_used"])
         self.assertEqual(calibrated_one["calibration"]["applied_profile"], "lenient")
         self.assertIn("presentation_boost", calibrated_one["calibration"]["applied_adjustments"])
         self.assertIn("balance_bonus", calibrated_one["calibration"]["applied_adjustments"])
@@ -295,9 +300,98 @@ class UPSCUpgradeTestCase(unittest.TestCase):
             calibration_enabled=True,
             calibration_mode="strict",
             calibration_seed=7,
+            question_id="q2",
+            answer_id="a2",
         )
         self.assertEqual(calibrated["calibration"]["variation"], 0.0)
+        self.assertIsNone(calibrated["calibration"]["calibration_seed_used"])
         self.assertEqual(calibrated["calibration"]["applied_profile"], "strict")
+
+    def test_signal_strategy_penalty_cap_is_enforced(self) -> None:
+        strategy = scoring_engine.score_from_signal_strategy(
+            signals={
+                "core_coverage_ratio": 0.8,
+                "core_depth_ratio": 0.8,
+                "directive_coverage_ratio": 0.8,
+                "clarity_score": 5,
+                "value_additions": {"data_or_report": 2, "example": 2, "generic": 2},
+                "vague_ratio": 0.9,
+                "factual_error_present": True,
+                "contradiction_present": True,
+                "penalty_flags": [
+                    {"type": "missing_conclusion", "severity": "medium"},
+                    {"flag": "poor_structure", "severity": "high"},
+                    {"flag": "excessive_vagueness", "severity": "high"},
+                ],
+                "structure": {"introduction": "present", "body": "structured", "conclusion": "missing"},
+                "dimension_balance": "average",
+                "confidence": "high",
+                "fundamental_weakness": False,
+            },
+            max_marks=10,
+            calibration_enabled=False,
+        )
+        self.assertGreater(strategy["raw_score"], 0.0)
+        self.assertAlmostEqual(strategy["raw_score"], 0.535, places=3)
+
+    def test_signal_strategy_bonus_cap_is_enforced(self) -> None:
+        calibrated = scoring_engine.score_from_signal_strategy(
+            signals={
+                "core_coverage_ratio": 0.9,
+                "core_depth_ratio": 0.8,
+                "directive_coverage_ratio": 0.8,
+                "clarity_score": 5,
+                "value_additions": {"data_or_report": 1, "example": 1, "generic": 1},
+                "vague_ratio": 0.1,
+                "factual_error_present": False,
+                "contradiction_present": False,
+                "penalty_flags": [],
+                "structure": {"introduction": "present", "body": "structured", "conclusion": "present"},
+                "dimension_balance": "good",
+                "confidence": "high",
+                "fundamental_weakness": False,
+                "extra_valid_concepts": [],
+            },
+            max_marks=10,
+            calibration_enabled=True,
+            calibration_mode="balanced",
+            calibration_seed=42,
+            question_id="q3",
+            answer_id="a3",
+        )
+        self.assertIn("presentation_boost", calibrated["calibration"]["applied_adjustments"])
+        self.assertIn("balance_bonus", calibrated["calibration"]["applied_adjustments"])
+        self.assertLessEqual(calibrated["calibration"]["calibrated_score"] - calibrated["base_final_normalized_score"], 0.07)
+
+    def test_signal_strategy_marks_range_stays_within_bounds(self) -> None:
+        low = scoring_engine.score_from_signal_strategy(signals={}, max_marks=10, calibration_enabled=False)
+        high = scoring_engine.score_from_signal_strategy(
+            signals={
+                "core_coverage_ratio": 1.0,
+                "core_depth_ratio": 1.0,
+                "directive_coverage_ratio": 1.0,
+                "clarity_score": 5,
+                "value_additions": {"data_or_report": 5, "example": 5, "generic": 5},
+                "structure": {"introduction": "present", "body": "structured", "conclusion": "present"},
+                "confidence": "high",
+            },
+            max_marks=10,
+            calibration_enabled=False,
+        )
+        self.assertGreaterEqual(low["marks_range"][0], 0.0)
+        self.assertLessEqual(low["marks_range"][1], 10.0)
+        self.assertGreaterEqual(high["marks_range"][0], 0.0)
+        self.assertLessEqual(high["marks_range"][1], 10.0)
+
+    def test_signal_strategy_handles_missing_keys_robustly(self) -> None:
+        strategy = scoring_engine.score_from_signal_strategy(
+            signals={"structure": {}, "value_additions": {}},
+            max_marks=15,
+            calibration_enabled=False,
+        )
+        self.assertEqual(strategy["confidence"], "medium")
+        self.assertEqual(strategy["estimated_marks"], 0.0)
+        self.assertEqual(strategy["marks_range"], [0.0, 0.5])
 
     def test_calibration_weights_can_be_updated(self) -> None:
         original = calibration_service.get_weights()

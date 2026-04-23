@@ -15,6 +15,8 @@ class CacheService:
         self.notes_cache: TTLCache[str, dict] = TTLCache(maxsize=128, ttl=ttl)
         self.flashcards_cache: TTLCache[str, list[dict]] = TTLCache(maxsize=128, ttl=ttl)
         self.model_answer_cache: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=ttl)
+        self.concept_universe_cache: TTLCache[str, list[dict]] = TTLCache(maxsize=256, ttl=ttl)
+        self.evaluation_result_cache: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=ttl)
         self.learning_bundle_cache: TTLCache[str, dict] = TTLCache(maxsize=128, ttl=ttl)
         self.review_cache: TTLCache[str, list[dict]] = TTLCache(maxsize=128, ttl=60)
         self.embedding_cache: TTLCache[str, list[float]] = TTLCache(maxsize=4096, ttl=ttl)
@@ -40,6 +42,18 @@ class CacheService:
 
     def set_model_answer(self, topic_id: str, question_hash: str, payload: dict) -> None:
         self.model_answer_cache[self._key("model_answer", topic_id, question_hash)] = payload
+
+    def get_concept_universe(self, question_id: str) -> list[dict] | None:
+        return self.concept_universe_cache.get(self._key("concept_universe", question_id))
+
+    def set_concept_universe(self, question_id: str, payload: list[dict]) -> None:
+        self.concept_universe_cache[self._key("concept_universe", question_id)] = payload
+
+    def get_evaluation_result(self, cache_key: str) -> dict | None:
+        return self.evaluation_result_cache.get(self._key("evaluation_result", cache_key))
+
+    def set_evaluation_result(self, cache_key: str, payload: dict) -> None:
+        self.evaluation_result_cache[self._key("evaluation_result", cache_key)] = payload
 
     def get_learning_bundle(self, topic_id: str) -> dict | None:
         return self.learning_bundle_cache.get(self._key("learning_bundle", topic_id))
