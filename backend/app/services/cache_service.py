@@ -47,7 +47,9 @@ class CacheService:
         return self.concept_universe_cache.get(self._key("concept_universe", question_id))
 
     def set_concept_universe(self, question_id: str, payload: list[dict]) -> None:
-        self.concept_universe_cache[self._key("concept_universe", question_id)] = payload
+        key = self._key("concept_universe", question_id)
+        if key not in self.concept_universe_cache:
+            self.concept_universe_cache[key] = payload
 
     def get_evaluation_result(self, cache_key: str) -> dict | None:
         return self.evaluation_result_cache.get(self._key("evaluation_result", cache_key))

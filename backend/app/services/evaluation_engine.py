@@ -8,6 +8,7 @@ from app.services.cache_service import cache_service
 from app.services.calibration_service import calibration_service
 from app.services.catalog_service import get_topic_context
 from app.services.continuity_service import build_next_action, update_answer_streak
+from app.services.feedback_engine import feedback_engine
 from app.services.flashcard_engine import flashcard_engine
 from app.services.llm_service import llm_service
 from app.services.notes_engine import notes_engine
@@ -74,6 +75,7 @@ class EvaluationEngine:
         question_hash = sha256_text(question.lower().strip())
         cached = cache_service.get_model_answer(topic["id"], question_hash)
         if cached:
+            cache_service.set_concept_universe(question_hash, self._concept_universe_from_model_answer(cached))
             return cached, "cache"
 
         row = db.fetch_one("SELECT * FROM model_answers WHERE topic_id = ? AND question_hash = ?", [topic["id"], question_hash])
@@ -89,6 +91,7 @@ class EvaluationEngine:
                     [stable_json_dumps(payload), sha256_json(payload), utc_now_iso(), row["id"]],
                 )
             cache_service.set_model_answer(topic["id"], question_hash, payload)
+            cache_service.set_concept_universe(question_hash, self._concept_universe_from_model_answer(payload))
             return payload, "database"
 
         payload = llm_service.generate_model_answer(question=question, topic=topic)
@@ -112,6 +115,7 @@ class EvaluationEngine:
             ],
         )
         cache_service.set_model_answer(topic["id"], question_hash, payload)
+        cache_service.set_concept_universe(question_hash, self._concept_universe_from_model_answer(payload))
         return payload, "ai"
 
     @staticmethod
@@ -152,6 +156,8 @@ class EvaluationEngine:
                     "calibration_enabled": bool(payload.get("calibration_enabled", True)),
                     "examiner_mode": str(payload.get("examiner_mode") or "balanced"),
                     "calibration_seed": payload.get("calibration_seed"),
+                    "safe_mode": payload.get("safe_mode"),
+                    "gs_paper": payload.get("gs_paper"),
                 }
             )
         )
@@ -160,10 +166,12 @@ class EvaluationEngine:
             return cached_result
 
         model_answer, _ = self._get_model_answer(topic=topic, question=question)
+        concept_universe = cache_service.get_concept_universe(question_id) or self._concept_universe_from_model_answer(model_answer)
+        cache_service.set_concept_universe(question_id, concept_universe)
         evaluation_signals = llm_service.analyze_answer_signals(
             question=question,
             cleaned_answer=normalized["cleaned_answer"],
-            concept_universe=self._concept_universe_from_model_answer(model_answer),
+            concept_universe=concept_universe,
         )
         features = scoring_engine.extract_features(
             cleaned_answer=normalized["cleaned_answer"],
@@ -194,6 +202,15 @@ class EvaluationEngine:
             calibration_seed=payload.get("calibration_seed"),
             question_id=question_id,
             answer_id=answer_id,
+            safe_mode=payload.get("safe_mode"),
+            gs_paper=payload.get("gs_paper"),
+        )
+        feedback = feedback_engine.generate_feedback(
+            {
+                **evaluation_signals,
+                "directive_score": normalized_scoring.get("directive_score", 0.0),
+                "value_score": normalized_scoring.get("value_score", 0.0),
+            }
         )
         guidance = llm_service.generate_evaluation_guidance(
             question=question,
@@ -265,6 +282,7 @@ class EvaluationEngine:
             "analysis": analysis,
             "evaluation_signals": evaluation_signals,
             "normalized_scoring": normalized_scoring,
+            "feedback": feedback,
         }
         db.execute(
             """
@@ -416,6 +434,10 @@ class EvaluationEngine:
                 "repeated_mistake": loop.get("repeated_mistake"),
                 "repeated_mistake_count": loop.get("repeated_mistake_count"),
                 "pressure_message": loop.get("pressure_message"),
+                "normalized_scoring": normalized_scoring,
+                "score_breakdown": normalized_scoring.get("score_breakdown", {}),
+                "feedback": feedback,
+                "scoring_version": normalized_scoring.get("scoring_version"),
             },
             "analysis": analysis,
             "notes": notes,
@@ -426,6 +448,7 @@ class EvaluationEngine:
             "features": features,
             "scoring": scoring,
             "normalized_scoring": normalized_scoring,
+            "feedback": feedback,
         }
         cache_service.set_evaluation_result(evaluation_cache_key, result)
         return result

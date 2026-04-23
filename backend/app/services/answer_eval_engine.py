@@ -6,6 +6,7 @@ from app.config import ROOT_DIR, settings
 from app.database import db
 from app.errors import input_invalid_error
 from app.services.cache_service import cache_service
+from app.services.feedback_engine import feedback_engine
 from app.schemas import TopicNormalizationPayload
 from app.services.llm_service import llm_service
 from app.services.scoring_engine import scoring_engine
@@ -234,6 +235,8 @@ class AnswerEvaluationEngine:
         calibration_enabled: bool = True,
         examiner_mode: str = "balanced",
         calibration_seed: int | None = None,
+        safe_mode: bool | None = None,
+        gs_paper: str | None = None,
     ) -> dict:
         question = normalize_text(question)
         self._raise_ocr_unavailable_if_needed(
@@ -267,6 +270,8 @@ class AnswerEvaluationEngine:
                     "calibration_enabled": calibration_enabled,
                     "examiner_mode": examiner_mode,
                     "calibration_seed": calibration_seed,
+                    "safe_mode": safe_mode,
+                    "gs_paper": gs_paper,
                     "concept_universe_hash": concept_universe_hash,
                 }
             )
@@ -306,6 +311,7 @@ class AnswerEvaluationEngine:
                 "improvements": list(evaluation.get("improvements", []) or []),
                 "model_answer": model_answer_json,
                 "subscores": evaluation.get("subscores", {}),
+                "feedback": analysis_json.get("feedback", evaluation.get("feedback")),
             }
             cache_service.set_evaluation_result(evaluation_cache_key, result)
             return result
@@ -349,6 +355,15 @@ class AnswerEvaluationEngine:
             calibration_seed=calibration_seed,
             question_id=question_id,
             answer_id=answer_id,
+            safe_mode=safe_mode,
+            gs_paper=gs_paper,
+        )
+        feedback = feedback_engine.generate_feedback(
+            {
+                **evaluation_signals,
+                "directive_score": normalized_scoring.get("directive_score", 0.0),
+                "value_score": normalized_scoring.get("value_score", 0.0),
+            }
         )
         guidance = llm_service.generate_evaluation_guidance(
             question=question,
@@ -403,8 +418,11 @@ class AnswerEvaluationEngine:
                 "expression_score": normalized_scoring.get("expression_score", 0.0),
                 "raw_score": normalized_scoring.get("raw_score", 0.0),
             },
+            "score_breakdown": normalized_scoring.get("score_breakdown", {}),
             "confidence": normalized_scoring.get("confidence", evaluation_signals.get("confidence", "medium")),
             "calibration": normalized_scoring.get("calibration", {}),
+            "feedback": feedback,
+            "scoring_version": normalized_scoring.get("scoring_version"),
         }
 
         raw_merged_text = normalize_text(normalized_input.get("source_text", {}).get("merged_text", ""))
@@ -430,6 +448,7 @@ class AnswerEvaluationEngine:
                         "features": features,
                         "evaluation_signals": evaluation_signals,
                         "normalized_scoring": normalized_scoring,
+                        "feedback": feedback,
                     }
                 ),
                 stable_json_dumps(
@@ -444,6 +463,8 @@ class AnswerEvaluationEngine:
                             "calibration_enabled": calibration_enabled,
                             "examiner_mode": examiner_mode,
                             "calibration_seed": calibration_seed,
+                            "safe_mode": safe_mode,
+                            "gs_paper": gs_paper,
                         },
                     }
                 ),
@@ -466,6 +487,7 @@ class AnswerEvaluationEngine:
             "improvements": improvements,
             "model_answer": model_answer,
             "subscores": subscores,
+            "feedback": feedback,
         }
         cache_service.set_evaluation_result(evaluation_cache_key, result)
         return result

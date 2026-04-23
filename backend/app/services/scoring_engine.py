@@ -5,6 +5,7 @@ import logging
 import random
 import re
 
+from app.config import settings
 from app.services.calibration_service import calibration_service
 from app.utils.common import clamp
 
@@ -81,6 +82,20 @@ EXAMINER_PROFILES = {
     },
 }
 logger = logging.getLogger(__name__)
+SCORING_VERSION = "v1.0"
+DEFAULT_COMPONENT_WEIGHTS = {
+    "content": 0.40,
+    "directive": 0.20,
+    "structure": 0.15,
+    "value": 0.10,
+    "expression": 0.10,
+}
+GS_WEIGHT_OVERRIDES = {
+    "GS1": {"content": 0.45},
+    "GS2": {"structure": 0.20, "value": 0.15},
+    "GS3": {},
+    "GS4": {"expression": 0.20},
+}
 
 
 class ScoringEngine:
@@ -91,6 +106,21 @@ class ScoringEngine:
     @staticmethod
     def _round_stage(value: float) -> float:
         return round(float(value), 4)
+
+    @staticmethod
+    def _normalized_component_weights(gs_paper: str | None) -> dict[str, float]:
+        weights = dict(DEFAULT_COMPONENT_WEIGHTS)
+        gs_key = str(gs_paper or "").upper()
+        weights.update(GS_WEIGHT_OVERRIDES.get(gs_key, {}))
+        total = sum(weights.values()) or 1.0
+        return {key: round(value / total, 4) for key, value in weights.items()}
+
+    @staticmethod
+    def _clamp_marks_range(*, estimated_marks: float, max_marks: int) -> list[float]:
+        return [
+            round(clamp(estimated_marks - 0.5, 0.0, float(max_marks)), 1),
+            round(clamp(estimated_marks + 0.5, 0.0, float(max_marks)), 1),
+        ]
 
     @staticmethod
     def _structure_component_score(value: str, *, body: bool = False) -> float:
@@ -124,6 +154,7 @@ class ScoringEngine:
         excessive_vagueness_penalty_applied: bool = False,
         mode: str = "balanced",
         enabled: bool = True,
+        safe_mode: bool = False,
         seed: int | None = None,
         question_id: str = "",
         answer_id: str = "",
@@ -136,15 +167,17 @@ class ScoringEngine:
         working_vague_ratio = float(vague_ratio or 0.0)
         body_structure = str((structure or {}).get("body") or "unstructured").lower()
 
-        if not enabled:
-            logger.debug("Signal score calibration disabled. Returning base final_score=%.3f", calibrated_score)
+        if not enabled or safe_mode:
+            reason = "safe_mode" if safe_mode else "disabled"
+            logger.debug("Signal score calibration skipped: reason=%s base_final_score=%.4f", reason, calibrated_score)
             return {
                 "calibrated_score": round(calibrated_score, 4),
                 "applied_profile": mode_key,
                 "applied_adjustments": applied_adjustments,
                 "variation": 0.0,
                 "calibration_seed_used": None,
-                "enabled": False,
+                "enabled": bool(enabled and not safe_mode),
+                "safe_mode": safe_mode,
             }
 
         logger.debug(
@@ -213,6 +246,7 @@ class ScoringEngine:
             "variation": round(variation, 4),
             "calibration_seed_used": stable_seed,
             "enabled": True,
+            "safe_mode": False,
         }
 
     def score_from_signal_strategy(
@@ -225,10 +259,13 @@ class ScoringEngine:
         calibration_seed: int | None = None,
         question_id: str = "",
         answer_id: str = "",
+        safe_mode: bool | None = None,
+        gs_paper: str | None = None,
     ) -> dict:
         """Compute the deterministic UPSC-style score from extracted evaluation signals."""
         signals = signals if isinstance(signals, dict) else {}
         max_marks = max(1, int(max_marks or 10))
+        safe_mode = bool(getattr(settings, "scoring_safe_mode", False)) if safe_mode is None else bool(safe_mode)
         core_coverage_ratio = float(signals.get("core_coverage_ratio", 0.0) or 0.0)
         core_depth_ratio = float(signals.get("core_depth_ratio", 0.0) or 0.0)
         directive_coverage_ratio = float(signals.get("directive_coverage_ratio", 0.0) or 0.0)
@@ -240,6 +277,7 @@ class ScoringEngine:
         penalty_flags = signals.get("penalty_flags", []) if isinstance(signals.get("penalty_flags"), list) else []
         fundamental_weakness = bool(signals.get("fundamental_weakness", False))
         dimension_balance = str(signals.get("dimension_balance", "average") or "average").lower()
+        weight_map = self._normalized_component_weights(gs_paper)
 
         intro_score = self._structure_component_score(str(structure.get("introduction") or "missing"))
         body_score = self._structure_component_score(str(structure.get("body") or "unstructured"), body=True)
@@ -261,23 +299,25 @@ class ScoringEngine:
         expression_score = clamp(clarity_score / 5.0, 0.0, 1.0)
 
         raw_score_before_penalty = clamp(
-            (core_score * 0.40)
-            + (directive_score * 0.20)
-            + (structure_score * 0.15)
-            + (value_score * 0.10)
-            + (expression_score * 0.10),
+            (core_score * weight_map["content"])
+            + (directive_score * weight_map["directive"])
+            + (structure_score * weight_map["structure"])
+            + (value_score * weight_map["value"])
+            + (expression_score * weight_map["expression"]),
             0.0,
             1.0,
         )
         logger.debug(
-            "Signal scoring normalization: core_score=%.3f directive_score=%.3f structure_score=%.3f value_score=%.3f expression_score=%.3f",
+            "Signal scoring normalization: core_score=%.3f directive_score=%.3f structure_score=%.3f value_score=%.3f expression_score=%.3f weights=%s gs_paper=%s",
             core_score,
             directive_score,
             structure_score,
             value_score,
             expression_score,
+            weight_map,
+            gs_paper,
         )
-        logger.debug("Signal scoring raw score before penalties: %.3f", raw_score_before_penalty)
+        logger.debug("Signal scoring raw score before penalties: %.4f", raw_score_before_penalty)
 
         applied_penalties: list[str] = []
         penalty_seen: set[str] = set()
@@ -318,7 +358,7 @@ class ScoringEngine:
         for flag, deduction in penalties_to_apply.items():
             applied_penalties.append(f"{flag}:{deduction:.2f}")
         logger.debug(
-            "Signal scoring penalties: penalties=%s total_penalty=%.3f penalized_score=%.3f",
+            "Signal scoring penalties: penalties=%s total_penalty=%.4f penalized_score=%.4f",
             penalties_to_apply,
             total_penalty,
             penalized_score,
@@ -344,7 +384,7 @@ class ScoringEngine:
         extra_bonus = self._round_stage(extra_bonus)
         adjusted_score = self._round_stage(capped_score + extra_bonus)
         logger.debug(
-            "Signal scoring caps and bonus: cap_score=%.3f capped_score=%.3f extra_bonus=%.3f adjusted_pre_confidence=%.3f",
+            "Signal scoring bonus: cap_score=%.4f capped_score=%.4f extra_bonus=%.4f adjusted_pre_confidence=%.4f",
             cap_score,
             capped_score,
             extra_bonus,
@@ -357,13 +397,13 @@ class ScoringEngine:
         elif confidence == "medium":
             adjusted_score = self._round_stage(adjusted_score * 0.97)
             applied_penalties.append("confidence_adjustment_0.97")
-        logger.debug("Signal scoring confidence: confidence=%s adjusted_score=%.4f", confidence, adjusted_score)
+        logger.debug("Signal scoring confidence: confidence=%s adjusted_score=%.4f safe_mode=%s", confidence, adjusted_score, safe_mode)
 
         if core_coverage_ratio > 0.6 and adjusted_score < 0.4 and not fundamental_weakness:
             adjusted_score = self._round_stage(0.4)
             applied_caps.append("core_strength_floor_0.4")
 
-        base_final_normalized_score = round(clamp(adjusted_score, 0.0, 1.0), 3)
+        base_final_normalized_score = self._round_stage(clamp(adjusted_score, 0.0, 1.0))
         calibration = self.calibrate_signal_score(
             final_score=base_final_normalized_score,
             core_depth_ratio=core_depth_ratio,
@@ -377,24 +417,31 @@ class ScoringEngine:
             excessive_vagueness_penalty_applied="excessive_vagueness" in penalties_to_apply,
             mode=calibration_mode,
             enabled=calibration_enabled,
+            safe_mode=safe_mode,
             seed=calibration_seed,
             question_id=question_id,
             answer_id=answer_id,
         )
-        final_normalized_score = float(calibration.get("calibrated_score", base_final_normalized_score))
+        final_normalized_score = self._round_stage(float(calibration.get("calibrated_score", base_final_normalized_score)))
+        final_normalized_score = self._round_stage(clamp(final_normalized_score, 0.0, 1.0))
         adjusted_marks = clamp(final_normalized_score * max_marks, 0.0, float(max_marks))
         estimated_marks = self._nearest_half(adjusted_marks)
-        marks_range = [
-            round(clamp(estimated_marks - 0.5, 0.0, float(max_marks)), 1),
-            round(clamp(estimated_marks + 0.5, 0.0, float(max_marks)), 1),
-        ]
+        marks_range = self._clamp_marks_range(estimated_marks=estimated_marks, max_marks=max_marks)
+        score_breakdown = {
+            "content": round(core_score, 4),
+            "directive": round(directive_score, 4),
+            "structure": round(structure_score, 4),
+            "value": round(value_score, 4),
+            "expression": round(expression_score, 4),
+        }
         logger.debug(
-            "Signal scoring final: base_final_normalized_score=%.4f final_normalized_score=%.4f estimated_marks=%.1f marks_range=%s confidence=%s",
+            "Signal scoring calibration/final: base_final_normalized_score=%.4f final_normalized_score=%.4f estimated_marks=%.1f marks_range=%s confidence=%s calibration=%s",
             base_final_normalized_score,
             final_normalized_score,
             estimated_marks,
             marks_range,
             confidence,
+            calibration,
         )
 
         return {
@@ -413,7 +460,32 @@ class ScoringEngine:
             "extra_bonus": round(extra_bonus, 3),
             "confidence": confidence,
             "calibration": calibration,
+            "safe_mode": safe_mode,
+            "gs_paper": str(gs_paper or "GS3"),
+            "weights": weight_map,
+            "score_breakdown": score_breakdown,
+            "scoring_version": SCORING_VERSION,
         }
+
+    def rank_answers(self, answer_scores: list[float]) -> dict:
+        """Return deterministic min-max normalized scores and ordinal rankings."""
+        cleaned_scores = [clamp(float(score or 0.0), 0.0, 1.0) for score in answer_scores or []]
+        if not cleaned_scores:
+            return {"rankings": [], "normalized_scores": []}
+        if len(cleaned_scores) == 1:
+            return {"rankings": [1], "normalized_scores": [1.0]}
+
+        minimum = min(cleaned_scores)
+        maximum = max(cleaned_scores)
+        if abs(maximum - minimum) < 1e-9:
+            normalized_scores = [0.5 for _ in cleaned_scores]
+        else:
+            normalized_scores = [round((score - minimum) / (maximum - minimum), 4) for score in cleaned_scores]
+
+        rankings = [0 for _ in cleaned_scores]
+        for position, index in enumerate(sorted(range(len(cleaned_scores)), key=lambda item: (-cleaned_scores[item], item)), start=1):
+            rankings[index] = position
+        return {"rankings": rankings, "normalized_scores": normalized_scores}
 
     def extract_features(self, *, cleaned_answer: str, sentence_list: list[str], topic: dict) -> dict:
         total_sentences = max(1, len(sentence_list))

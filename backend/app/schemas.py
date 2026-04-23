@@ -913,6 +913,12 @@ class ScoringBreakdownPayload(BaseModel):
     weights: CalibrationWeightsPayload
 
 
+class FeedbackPayload(BaseModel):
+    strengths: list[str] = Field(default_factory=list)
+    weaknesses: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+
+
 class EvaluationPayload(BaseModel):
     score: int
     scaled_score: float
@@ -949,6 +955,10 @@ class EvaluationPayload(BaseModel):
     repeated_mistake: str | None = None
     repeated_mistake_count: int | None = None
     pressure_message: str | None = None
+    normalized_scoring: dict[str, Any] | None = None
+    score_breakdown: dict[str, float] | None = None
+    feedback: FeedbackPayload | None = None
+    scoring_version: str | None = None
 
 
 class EvaluateUPSCRequest(BaseModel):
@@ -964,6 +974,8 @@ class EvaluateUPSCRequest(BaseModel):
     calibration_enabled: bool = True
     examiner_mode: Literal["strict", "balanced", "lenient"] = "balanced"
     calibration_seed: int | None = None
+    safe_mode: bool | None = None
+    gs_paper: Literal["GS1", "GS2", "GS3", "GS4"] | None = None
 
     @field_validator("handwritten_image_mime_type")
     @classmethod
@@ -1004,6 +1016,8 @@ class EvaluateUPSCData(BaseModel):
     similarity: SimilarityPayload
     features: FeaturePayload
     scoring: ScoringBreakdownPayload
+    normalized_scoring: dict[str, Any] | None = None
+    feedback: FeedbackPayload | None = None
 
 
 class DailyQuestionPayload(BaseModel):
@@ -1350,6 +1364,8 @@ class EvaluateStrictRequest(BaseModel):
     calibration_enabled: bool = True
     examiner_mode: Literal["strict", "balanced", "lenient"] = "balanced"
     calibration_seed: int | None = None
+    safe_mode: bool | None = None
+    gs_paper: Literal["GS1", "GS2", "GS3", "GS4"] | None = None
 
     @field_validator("handwritten_image_mime_type")
     @classmethod
@@ -1406,6 +1422,7 @@ class EvaluateStrictData(BaseModel):
     improvements: list[str]
     model_answer: dict[str, Any]
     subscores: EvaluationSubscoresPayload
+    feedback: FeedbackPayload | None = None
 
 
 class EvaluateStrictResponse(BaseModel):

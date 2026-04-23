@@ -100,6 +100,8 @@ def evaluation_evaluate(payload: EvaluateStrictRequest, current_user: dict = Dep
         calibration_enabled=payload.calibration_enabled,
         examiner_mode=payload.examiner_mode,
         calibration_seed=payload.calibration_seed,
+        safe_mode=payload.safe_mode,
+        gs_paper=payload.gs_paper,
     )
     return {"ok": True, "data": data, "meta": EnvelopeMeta(request_id=new_id("req"))}
 
