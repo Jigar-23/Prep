@@ -233,6 +233,72 @@ class UPSCUpgradeTestCase(unittest.TestCase):
         self.assertIn("confidence_adjustment_0.90", strategy["applied_penalties"])
         self.assertTrue(isinstance(strategy["marks_range"], list) and len(strategy["marks_range"]) == 2)
 
+    def test_signal_strategy_calibration_is_deterministic_with_seed(self) -> None:
+        signals = {
+            "core_coverage_ratio": 0.72,
+            "core_depth_ratio": 0.61,
+            "directive_coverage_ratio": 0.75,
+            "clarity_score": 4,
+            "value_additions": {"data_or_report": 1, "example": 1, "generic": 0},
+            "vague_ratio": 0.22,
+            "factual_error_present": False,
+            "contradiction_present": False,
+            "penalty_flags": [],
+            "structure": {"introduction": "present", "body": "structured", "conclusion": "present"},
+            "dimension_balance": "good",
+            "confidence": "medium",
+            "fundamental_weakness": False,
+            "extra_valid_concepts": ["useful extra concept"],
+        }
+        calibrated_one = scoring_engine.score_from_signal_strategy(
+            signals=signals,
+            max_marks=10,
+            calibration_enabled=True,
+            calibration_mode="lenient",
+            calibration_seed=1234,
+        )
+        calibrated_two = scoring_engine.score_from_signal_strategy(
+            signals=signals,
+            max_marks=10,
+            calibration_enabled=True,
+            calibration_mode="lenient",
+            calibration_seed=1234,
+        )
+        self.assertEqual(calibrated_one["final_normalized_score"], calibrated_two["final_normalized_score"])
+        self.assertEqual(calibrated_one["estimated_marks"], calibrated_two["estimated_marks"])
+        self.assertEqual(calibrated_one["calibration"]["variation"], calibrated_two["calibration"]["variation"])
+        self.assertEqual(calibrated_one["calibration"]["applied_profile"], "lenient")
+        self.assertIn("presentation_boost", calibrated_one["calibration"]["applied_adjustments"])
+        self.assertIn("balance_bonus", calibrated_one["calibration"]["applied_adjustments"])
+        self.assertIn("profile_adjustment", calibrated_one["calibration"]["applied_adjustments"])
+        self.assertIn("variation", calibrated_one["calibration"]["applied_adjustments"])
+
+    def test_signal_strategy_calibration_disables_variation_for_fundamental_weakness(self) -> None:
+        calibrated = scoring_engine.score_from_signal_strategy(
+            signals={
+                "core_coverage_ratio": 0.2,
+                "core_depth_ratio": 0.1,
+                "directive_coverage_ratio": 0.4,
+                "clarity_score": 2,
+                "value_additions": {"data_or_report": 0, "example": 0, "generic": 0},
+                "vague_ratio": 0.6,
+                "factual_error_present": False,
+                "contradiction_present": False,
+                "penalty_flags": [],
+                "structure": {"introduction": "weak", "body": "semi", "conclusion": "missing"},
+                "dimension_balance": "poor",
+                "confidence": "low",
+                "fundamental_weakness": True,
+                "extra_valid_concepts": [],
+            },
+            max_marks=10,
+            calibration_enabled=True,
+            calibration_mode="strict",
+            calibration_seed=7,
+        )
+        self.assertEqual(calibrated["calibration"]["variation"], 0.0)
+        self.assertEqual(calibrated["calibration"]["applied_profile"], "strict")
+
     def test_calibration_weights_can_be_updated(self) -> None:
         original = calibration_service.get_weights()
         try:

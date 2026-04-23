@@ -168,6 +168,9 @@ class EvaluationEngine:
         normalized_scoring = scoring_engine.score_from_signal_strategy(
             signals=evaluation_signals,
             max_marks=payload["max_marks"],
+            calibration_enabled=bool(payload.get("calibration_enabled", True)),
+            calibration_mode=str(payload.get("examiner_mode") or "balanced"),
+            calibration_seed=payload.get("calibration_seed"),
         )
         guidance = llm_service.generate_evaluation_guidance(
             question=question,

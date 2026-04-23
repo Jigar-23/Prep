@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import re
 
 from app.services.calibration_service import calibration_service
@@ -62,6 +63,23 @@ TRANSITION_MARKERS = {"first", "second", "third", "further", "moreover", "howeve
 THINKING_ORDER = {"DESCRIPTIVE": 1, "ANALYTICAL": 2, "CRITICAL": 3}
 DEPTH_ORDER = {"SURFACE": 1, "MODERATE": 2, "DEEP": 3}
 VAGUENESS_ORDER = {"LOW": 1, "MODERATE": 2, "HIGH": 3}
+EXAMINER_PROFILES = {
+    "strict": {
+        "penalty_multiplier": 1.2,
+        "bonus_multiplier": 0.8,
+        "leniency": 0.95,
+    },
+    "balanced": {
+        "penalty_multiplier": 1.0,
+        "bonus_multiplier": 1.0,
+        "leniency": 1.0,
+    },
+    "lenient": {
+        "penalty_multiplier": 0.8,
+        "bonus_multiplier": 1.2,
+        "leniency": 1.05,
+    },
+}
 logger = logging.getLogger(__name__)
 
 
@@ -77,7 +95,140 @@ class ScoringEngine:
             return 1.0 if lowered == "structured" else 0.5 if lowered == "semi" else 0.0
         return 1.0 if lowered == "present" else 0.5 if lowered == "weak" else 0.0
 
-    def score_from_signal_strategy(self, *, signals: dict, max_marks: int) -> dict:
+    @staticmethod
+    def _stable_variation_seed(
+        *,
+        seed: int | None,
+        mode: str,
+        final_score: float,
+        core_depth_ratio: float,
+        core_coverage_ratio: float,
+        directive_coverage_ratio: float,
+        body_structure: str,
+        clarity_score: int,
+        vague_ratio: float,
+        dimension_balance: str,
+    ) -> int:
+        payload = "|".join(
+            [
+                str(seed if seed is not None else "auto"),
+                mode,
+                f"{final_score:.6f}",
+                f"{core_depth_ratio:.6f}",
+                f"{core_coverage_ratio:.6f}",
+                f"{directive_coverage_ratio:.6f}",
+                body_structure,
+                str(clarity_score),
+                f"{vague_ratio:.6f}",
+                dimension_balance,
+            ]
+        )
+        return int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16], 16)
+
+    def calibrate_signal_score(
+        self,
+        *,
+        final_score: float,
+        core_depth_ratio: float,
+        core_coverage_ratio: float,
+        directive_coverage_ratio: float,
+        structure: dict,
+        clarity_score: int,
+        vague_ratio: float,
+        dimension_balance: str,
+        fundamental_weakness: bool,
+        mode: str = "balanced",
+        enabled: bool = True,
+        seed: int | None = None,
+    ) -> dict:
+        mode_key = str(mode or "balanced").lower()
+        profile = EXAMINER_PROFILES.get(mode_key, EXAMINER_PROFILES["balanced"])
+        calibrated_score = clamp(float(final_score or 0.0), 0.0, 1.0)
+        applied_adjustments: list[str] = []
+        working_vague_ratio = float(vague_ratio or 0.0)
+        body_structure = str((structure or {}).get("body") or "unstructured").lower()
+
+        if not enabled:
+            logger.debug("Signal score calibration disabled. Returning base final_score=%.3f", calibrated_score)
+            return {
+                "calibrated_score": round(calibrated_score, 3),
+                "applied_profile": mode_key,
+                "applied_adjustments": applied_adjustments,
+                "variation": 0.0,
+                "enabled": False,
+            }
+
+        logger.debug(
+            "Calibration start: mode=%s profile=%s base_final_score=%.3f",
+            mode_key,
+            profile,
+            calibrated_score,
+        )
+
+        if core_depth_ratio > 0.6 and working_vague_ratio > 0.5:
+            working_vague_ratio = round(working_vague_ratio * 0.8, 3)
+            applied_adjustments.append("consistency_correction")
+
+        if body_structure == "structured" and int(clarity_score or 0) >= 4:
+            calibrated_score += 0.03
+            applied_adjustments.append("presentation_boost")
+
+        if str(dimension_balance or "").lower() == "good" and float(core_depth_ratio or 0.0) > 0.5:
+            calibrated_score += 0.03
+            applied_adjustments.append("balance_bonus")
+
+        if working_vague_ratio > 0.4 and float(core_depth_ratio or 0.0) < 0.4:
+            calibrated_score -= 0.05
+            applied_adjustments.append("bluff_penalty")
+
+        calibrated_score *= float(profile["leniency"])
+        applied_adjustments.append("profile_adjustment")
+
+        if fundamental_weakness:
+            variation = 0.0
+        else:
+            stable_seed = self._stable_variation_seed(
+                seed=seed,
+                mode=mode_key,
+                final_score=calibrated_score,
+                core_depth_ratio=core_depth_ratio,
+                core_coverage_ratio=core_coverage_ratio,
+                directive_coverage_ratio=directive_coverage_ratio,
+                body_structure=body_structure,
+                clarity_score=clarity_score,
+                vague_ratio=working_vague_ratio,
+                dimension_balance=str(dimension_balance or ""),
+            )
+            variation = random.Random(stable_seed).uniform(-0.02, 0.02)
+        calibrated_score += variation
+        applied_adjustments.append("variation")
+
+        calibrated_score = round(clamp(calibrated_score, 0.0, 1.0), 3)
+        logger.debug(
+            "Calibration final: calibrated_score=%.3f mode=%s variation=%.4f working_vague_ratio=%.3f adjustments=%s",
+            calibrated_score,
+            mode_key,
+            variation,
+            working_vague_ratio,
+            applied_adjustments,
+        )
+        return {
+            "calibrated_score": calibrated_score,
+            "applied_profile": mode_key,
+            "applied_adjustments": applied_adjustments,
+            "variation": round(variation, 4),
+            "enabled": True,
+        }
+
+    def score_from_signal_strategy(
+        self,
+        *,
+        signals: dict,
+        max_marks: int,
+        calibration_enabled: bool = False,
+        calibration_mode: str = "balanced",
+        calibration_seed: int | None = None,
+    ) -> dict:
         max_marks = max(1, int(max_marks or 10))
         core_coverage_ratio = float(signals.get("core_coverage_ratio", 0.0) or 0.0)
         core_depth_ratio = float(signals.get("core_depth_ratio", 0.0) or 0.0)
@@ -89,6 +240,7 @@ class ScoringEngine:
         confidence = str(signals.get("confidence", "medium") or "medium").lower()
         penalty_flags = signals.get("penalty_flags", []) if isinstance(signals.get("penalty_flags"), list) else []
         fundamental_weakness = bool(signals.get("fundamental_weakness", False))
+        dimension_balance = str(signals.get("dimension_balance", "average") or "average").lower()
 
         intro_score = self._structure_component_score(str(structure.get("introduction") or "missing"))
         body_score = self._structure_component_score(str(structure.get("body") or "unstructured"), body=True)
@@ -203,7 +355,22 @@ class ScoringEngine:
             adjusted_score = 0.4
             applied_caps.append("core_strength_floor_0.4")
 
-        final_normalized_score = round(clamp(adjusted_score, 0.0, 1.0), 3)
+        base_final_normalized_score = round(clamp(adjusted_score, 0.0, 1.0), 3)
+        calibration = self.calibrate_signal_score(
+            final_score=base_final_normalized_score,
+            core_depth_ratio=core_depth_ratio,
+            core_coverage_ratio=core_coverage_ratio,
+            directive_coverage_ratio=directive_coverage_ratio,
+            structure=structure,
+            clarity_score=clarity_score,
+            vague_ratio=vague_ratio,
+            dimension_balance=dimension_balance,
+            fundamental_weakness=fundamental_weakness,
+            mode=calibration_mode,
+            enabled=calibration_enabled,
+            seed=calibration_seed,
+        )
+        final_normalized_score = float(calibration.get("calibrated_score", base_final_normalized_score))
         adjusted_marks = clamp(final_normalized_score * max_marks, 0.0, float(max_marks))
         estimated_marks = self._nearest_half(adjusted_marks)
         marks_range = [
@@ -225,6 +392,7 @@ class ScoringEngine:
             "value_score": round(value_score, 3),
             "expression_score": round(expression_score, 3),
             "raw_score": round(penalized_score, 3),
+            "base_final_normalized_score": base_final_normalized_score,
             "final_normalized_score": final_normalized_score,
             "estimated_marks": round(estimated_marks, 1),
             "marks_range": marks_range,
@@ -232,6 +400,7 @@ class ScoringEngine:
             "applied_caps": applied_caps,
             "extra_bonus": round(extra_bonus, 3),
             "confidence": confidence,
+            "calibration": calibration,
         }
 
     def extract_features(self, *, cleaned_answer: str, sentence_list: list[str], topic: dict) -> dict:

@@ -961,6 +961,9 @@ class EvaluateUPSCRequest(BaseModel):
     handwritten_image_mime_type: str | None = None
     max_marks: int = Field(default=10, ge=5, le=20)
     include_learning_assets: bool = True
+    calibration_enabled: bool = True
+    examiner_mode: Literal["strict", "balanced", "lenient"] = "balanced"
+    calibration_seed: int | None = None
 
     @field_validator("handwritten_image_mime_type")
     @classmethod
@@ -1344,6 +1347,9 @@ class EvaluateStrictRequest(BaseModel):
     handwritten_image_mime_type: str | None = None
     concept_universe: list[str | ConceptUniverseItemPayload] = Field(default_factory=list)
     max_marks: int = Field(default=10, ge=1, le=20)
+    calibration_enabled: bool = True
+    examiner_mode: Literal["strict", "balanced", "lenient"] = "balanced"
+    calibration_seed: int | None = None
 
     @field_validator("handwritten_image_mime_type")
     @classmethod

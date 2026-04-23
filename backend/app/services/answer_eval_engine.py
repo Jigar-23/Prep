@@ -228,6 +228,9 @@ class AnswerEvaluationEngine:
         handwritten_image_mime_type: str | None,
         concept_universe: list[dict[str, str] | str] | None = None,
         max_marks: int = 10,
+        calibration_enabled: bool = True,
+        examiner_mode: str = "balanced",
+        calibration_seed: int | None = None,
     ) -> dict:
         question = normalize_text(question)
         self._raise_ocr_unavailable_if_needed(
@@ -282,6 +285,9 @@ class AnswerEvaluationEngine:
         normalized_scoring = scoring_engine.score_from_signal_strategy(
             signals=evaluation_signals,
             max_marks=max_marks,
+            calibration_enabled=calibration_enabled,
+            calibration_mode=examiner_mode,
+            calibration_seed=calibration_seed,
         )
         guidance = llm_service.generate_evaluation_guidance(
             question=question,
@@ -337,6 +343,7 @@ class AnswerEvaluationEngine:
                 "raw_score": normalized_scoring.get("raw_score", 0.0),
             },
             "confidence": normalized_scoring.get("confidence", evaluation_signals.get("confidence", "medium")),
+            "calibration": normalized_scoring.get("calibration", {}),
         }
 
         raw_merged_text = normalize_text(normalized_input.get("source_text", {}).get("merged_text", ""))

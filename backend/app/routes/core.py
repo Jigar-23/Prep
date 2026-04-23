@@ -97,6 +97,9 @@ def evaluation_evaluate(payload: EvaluateStrictRequest, current_user: dict = Dep
         handwritten_image_mime_type=payload.handwritten_image_mime_type,
         concept_universe=payload.concept_universe,
         max_marks=payload.max_marks,
+        calibration_enabled=payload.calibration_enabled,
+        examiner_mode=payload.examiner_mode,
+        calibration_seed=payload.calibration_seed,
     )
     return {"ok": True, "data": data, "meta": EnvelopeMeta(request_id=new_id("req"))}
 
