@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 
 from app.services.calibration_service import calibration_service
@@ -61,9 +62,178 @@ TRANSITION_MARKERS = {"first", "second", "third", "further", "moreover", "howeve
 THINKING_ORDER = {"DESCRIPTIVE": 1, "ANALYTICAL": 2, "CRITICAL": 3}
 DEPTH_ORDER = {"SURFACE": 1, "MODERATE": 2, "DEEP": 3}
 VAGUENESS_ORDER = {"LOW": 1, "MODERATE": 2, "HIGH": 3}
+logger = logging.getLogger(__name__)
 
 
 class ScoringEngine:
+    @staticmethod
+    def _nearest_half(value: float) -> float:
+        return round(value * 2) / 2
+
+    @staticmethod
+    def _structure_component_score(value: str, *, body: bool = False) -> float:
+        lowered = str(value or "").lower()
+        if body:
+            return 1.0 if lowered == "structured" else 0.5 if lowered == "semi" else 0.0
+        return 1.0 if lowered == "present" else 0.5 if lowered == "weak" else 0.0
+
+    def score_from_signal_strategy(self, *, signals: dict, max_marks: int) -> dict:
+        max_marks = max(1, int(max_marks or 10))
+        core_coverage_ratio = float(signals.get("core_coverage_ratio", 0.0) or 0.0)
+        core_depth_ratio = float(signals.get("core_depth_ratio", 0.0) or 0.0)
+        directive_coverage_ratio = float(signals.get("directive_coverage_ratio", 0.0) or 0.0)
+        clarity_score = int(signals.get("clarity_score", 0) or 0)
+        vague_ratio = float(signals.get("vague_ratio", 0.0) or 0.0)
+        value_additions = signals.get("value_additions", {}) if isinstance(signals.get("value_additions"), dict) else {}
+        structure = signals.get("structure", {}) if isinstance(signals.get("structure"), dict) else {}
+        confidence = str(signals.get("confidence", "medium") or "medium").lower()
+        penalty_flags = signals.get("penalty_flags", []) if isinstance(signals.get("penalty_flags"), list) else []
+        fundamental_weakness = bool(signals.get("fundamental_weakness", False))
+
+        intro_score = self._structure_component_score(str(structure.get("introduction") or "missing"))
+        body_score = self._structure_component_score(str(structure.get("body") or "unstructured"), body=True)
+        conclusion_score = self._structure_component_score(str(structure.get("conclusion") or "missing"))
+
+        core_score = clamp((0.7 * core_coverage_ratio) + (0.3 * core_depth_ratio), 0.0, 1.0)
+        directive_score = clamp(directive_coverage_ratio, 0.0, 1.0)
+        structure_score = clamp((intro_score * 0.3) + (body_score * 0.4) + (conclusion_score * 0.3), 0.0, 1.0)
+        value_score = clamp(
+            (
+                (2.0 * float(value_additions.get("data_or_report", 0) or 0))
+                + (1.0 * float(value_additions.get("example", 0) or 0))
+                + (0.5 * float(value_additions.get("generic", 0) or 0))
+            )
+            / 5.0,
+            0.0,
+            1.0,
+        )
+        expression_score = clamp(clarity_score / 5.0, 0.0, 1.0)
+
+        raw_score_before_penalty = clamp(
+            (core_score * 0.40)
+            + (directive_score * 0.20)
+            + (structure_score * 0.15)
+            + (value_score * 0.10)
+            + (expression_score * 0.10),
+            0.0,
+            1.0,
+        )
+        logger.debug(
+            "Signal scoring normalization: core_score=%.3f directive_score=%.3f structure_score=%.3f value_score=%.3f expression_score=%.3f",
+            core_score,
+            directive_score,
+            structure_score,
+            value_score,
+            expression_score,
+        )
+        logger.debug("Signal scoring raw score before penalties: %.3f", raw_score_before_penalty)
+
+        applied_penalties: list[str] = []
+        base_penalty_map = {
+            "missing_conclusion": 0.05,
+            "poor_structure": 0.07,
+            "excessive_vagueness": 0.05,
+            "factual_error_present": 0.10,
+            "contradiction_present": 0.08,
+        }
+        severity_penalty_map = {
+            "low": 0.02,
+            "medium": 0.05,
+            "high": 0.10,
+        }
+        penalties_to_apply: dict[str, float] = {}
+        for item in penalty_flags:
+            if not isinstance(item, dict):
+                continue
+            flag = str(item.get("flag") or item.get("type") or "")
+            severity = str(item.get("severity") or "").lower()
+            if flag in base_penalty_map:
+                penalties_to_apply[flag] = base_penalty_map[flag]
+            elif severity in severity_penalty_map:
+                penalties_to_apply[flag] = severity_penalty_map[severity]
+            else:
+                continue
+        if bool(signals.get("factual_error_present", False)):
+            penalties_to_apply["factual_error_present"] = base_penalty_map["factual_error_present"]
+        if bool(signals.get("contradiction_present", False)):
+            penalties_to_apply["contradiction_present"] = base_penalty_map["contradiction_present"]
+
+        total_penalty = round(min(0.25, sum(penalties_to_apply.values())), 3)
+        penalized_score = clamp(raw_score_before_penalty - total_penalty, 0.0, 1.0)
+        for flag, deduction in penalties_to_apply.items():
+            applied_penalties.append(f"{flag}:{deduction:.2f}")
+        logger.debug(
+            "Signal scoring penalties: penalties=%s total_penalty=%.3f penalized_score=%.3f",
+            penalties_to_apply,
+            total_penalty,
+            penalized_score,
+        )
+
+        cap_score = 1.0
+        applied_caps: list[str] = []
+        if core_coverage_ratio < 0.4:
+            cap_score = min(cap_score, 0.4)
+            applied_caps.append("weak_core_coverage_cap_0.4")
+        if str(structure.get("body") or "").lower() == "unstructured":
+            cap_score = min(cap_score, 0.6)
+            applied_caps.append("unstructured_body_cap_0.6")
+        if directive_coverage_ratio < 0.3:
+            cap_score = min(cap_score, 0.5)
+            applied_caps.append("low_directive_coverage_cap_0.5")
+
+        capped_score = min(penalized_score, cap_score)
+        extra_bonus = min(0.1, len(signals.get("extra_valid_concepts", []) or []) * 0.02)
+        adjusted_score = capped_score + extra_bonus
+        logger.debug(
+            "Signal scoring caps and bonus: cap_score=%.3f capped_score=%.3f extra_bonus=%.3f adjusted_pre_confidence=%.3f",
+            cap_score,
+            capped_score,
+            extra_bonus,
+            adjusted_score,
+        )
+
+        if confidence == "low":
+            adjusted_score *= 0.90
+            applied_penalties.append("confidence_adjustment_0.90")
+        elif confidence == "medium":
+            adjusted_score *= 0.97
+            applied_penalties.append("confidence_adjustment_0.97")
+
+        if core_coverage_ratio > 0.6 and adjusted_score < 0.4 and not fundamental_weakness:
+            adjusted_score = 0.4
+            applied_caps.append("core_strength_floor_0.4")
+
+        final_normalized_score = round(clamp(adjusted_score, 0.0, 1.0), 3)
+        adjusted_marks = clamp(final_normalized_score * max_marks, 0.0, float(max_marks))
+        estimated_marks = self._nearest_half(adjusted_marks)
+        marks_range = [
+            round(estimated_marks - 0.5, 1),
+            round(estimated_marks + 0.5, 1),
+        ]
+        logger.debug(
+            "Signal scoring final: final_normalized_score=%.3f estimated_marks=%.1f marks_range=%s confidence=%s",
+            final_normalized_score,
+            estimated_marks,
+            marks_range,
+            confidence,
+        )
+
+        return {
+            "core_score": round(core_score, 3),
+            "directive_score": round(directive_score, 3),
+            "structure_score": round(structure_score, 3),
+            "value_score": round(value_score, 3),
+            "expression_score": round(expression_score, 3),
+            "raw_score": round(penalized_score, 3),
+            "final_normalized_score": final_normalized_score,
+            "estimated_marks": round(estimated_marks, 1),
+            "marks_range": marks_range,
+            "applied_penalties": applied_penalties,
+            "applied_caps": applied_caps,
+            "extra_bonus": round(extra_bonus, 3),
+            "confidence": confidence,
+        }
+
     def extract_features(self, *, cleaned_answer: str, sentence_list: list[str], topic: dict) -> dict:
         total_sentences = max(1, len(sentence_list))
         word_count = len(re.findall(r"[a-zA-Z0-9]+", cleaned_answer))
@@ -278,6 +448,47 @@ class ScoringEngine:
             "structure": directive["structure"],
             "vagueness": vagueness,
             "alternative_valid": content["alternative_valid"],
+        }
+
+    def merge_analysis_from_signals(self, *, signals: dict, features: dict, similarity: dict) -> dict:
+        content_hint = float(signals.get("content_quality_score_hint", 0) or 0)
+        expression_hint = float(signals.get("expression_quality_score_hint", 0) or 0)
+        directive_satisfaction = str(signals.get("directive_satisfaction", "partial")).lower()
+        balance = str(signals.get("dimension_balance", "average")).lower()
+        body_structure = str(signals.get("body_structure", "semi-structured")).lower()
+        conclusion_type = str(signals.get("conclusion_type", "missing")).lower()
+        factual_error_present = bool(signals.get("factual_error_present", False))
+        contradiction_present = bool(signals.get("contradiction_present", False))
+
+        relevance = "FULL" if directive_satisfaction == "good" and len(similarity["covered_concepts"]) >= 3 else "PARTIAL" if similarity["covered_concepts"] else "OFF_TOPIC"
+        depth = "DEEP" if content_hint >= 8 or balance == "good" else "MODERATE" if content_hint >= 5 or balance == "average" else "SURFACE"
+        thinking = "CRITICAL" if balance == "good" and expression_hint >= 7 else "ANALYTICAL" if content_hint >= 5 else "DESCRIPTIVE"
+        directive = "FULL" if directive_satisfaction == "good" else "PARTIAL" if directive_satisfaction == "partial" else "NONE"
+        structure = "STRONG" if body_structure == "structured" and conclusion_type == "present" else "ADEQUATE" if body_structure in {"structured", "semi-structured"} else "WEAK"
+        vagueness = self._stronger_level(features["vagueness_from_signals"], features["vagueness_from_signals"], VAGUENESS_ORDER)
+        missing_points = list(dict.fromkeys(list(signals.get("concepts_missing", [])) + similarity["missing_concepts"]))
+        incorrect_points = [str(item) for item in signals.get("irrelevant_concepts", [])]
+        if contradiction_present:
+            incorrect_points.append("Internal contradiction present")
+        if factual_error_present:
+            incorrect_points.append("Factual error present")
+        concept_scores = [item for item in signals.get("concept_scores", []) if isinstance(item, dict)]
+        core_points = [str(item.get("concept") or "") for item in concept_scores if str(item.get("importance") or "") == "core"]
+        secondary_points = [str(item.get("concept") or "") for item in concept_scores if str(item.get("importance") or "") != "core"]
+        return {
+            "relevance": relevance,
+            "domain": "WRONG" if factual_error_present else "CORRECT",
+            "must_have_points": core_points[:6] or [str(item) for item in signals.get("concepts_expected", [])[:6]],
+            "good_to_have_points": secondary_points[:6] or [str(item) for item in signals.get("concepts_expected", [])[6:12]],
+            "extra_edge_points": [],
+            "missing_points": missing_points,
+            "incorrect_points": incorrect_points,
+            "depth": depth,
+            "thinking": thinking,
+            "directive": directive,
+            "structure": structure,
+            "vagueness": vagueness,
+            "alternative_valid": True,
         }
 
     def score(

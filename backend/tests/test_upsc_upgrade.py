@@ -16,10 +16,13 @@ from app.services.notes_engine import notes_engine
 from app.services.performance_service import _trend_delta
 from app.services.scoring_engine import scoring_engine
 from app.services.similarity_engine import similarity_engine
+from app.services.study_service import get_dashboard, get_topic_page
+from app.services.subtopic_notes_service import subtopic_notes_service
 from app.utils.common import new_id, utc_now_iso
 
 
 TOPIC_ID = "topic_upsc_polity_fundamental_rights"
+UPSC_EXAM_ID = "exam_upsc"
 
 
 class UPSCUpgradeTestCase(unittest.TestCase):
@@ -195,6 +198,41 @@ class UPSCUpgradeTestCase(unittest.TestCase):
         self.assertGreaterEqual(strong_scoring["impression_score"], round(strong_scoring["structure_score"] * 0.75, 3))
         self.assertGreater(strong_scoring["final_score"], weak_scoring["final_score"])
 
+    def test_signal_strategy_scoring_applies_caps(self) -> None:
+        strategy = scoring_engine.score_from_signal_strategy(
+            signals={
+                "core_coverage_ratio": 0.3,
+                "core_depth_ratio": 0.1,
+                "directive_coverage_ratio": 0.2,
+                "clarity_score": 3,
+                "value_additions": {"data_or_report": 1, "example": 1, "generic": 1},
+                "vague_ratio": 0.7,
+                "factual_error_present": False,
+                "contradiction_present": False,
+                "penalty_flags": [
+                    {"type": "missing_conclusion", "severity": "medium"},
+                    {"flag": "poor_structure", "severity": "high"},
+                    {"flag": "weak_core_coverage", "severity": "high"},
+                    {"flag": "excessive_vagueness", "severity": "high"},
+                ],
+                "structure": {"introduction": "weak", "body": "unstructured", "conclusion": "missing"},
+                "confidence": "low",
+                "extra_valid_concepts": ["strong outside-universe concept"],
+            },
+            max_marks=10,
+        )
+        self.assertEqual(strategy["confidence"], "low")
+        self.assertIn("weak_core_coverage_cap_0.4", strategy["applied_caps"])
+        self.assertIn("unstructured_body_cap_0.6", strategy["applied_caps"])
+        self.assertIn("low_directive_coverage_cap_0.5", strategy["applied_caps"])
+        self.assertLessEqual(strategy["final_normalized_score"], 0.4)
+        self.assertLessEqual(strategy["estimated_marks"], 4.0)
+        self.assertGreater(strategy["extra_bonus"], 0.0)
+        self.assertLessEqual(strategy["raw_score"], 0.25)
+        self.assertTrue(any(item.startswith("missing_conclusion:") for item in strategy["applied_penalties"]))
+        self.assertIn("confidence_adjustment_0.90", strategy["applied_penalties"])
+        self.assertTrue(isinstance(strategy["marks_range"], list) and len(strategy["marks_range"]) == 2)
+
     def test_calibration_weights_can_be_updated(self) -> None:
         original = calibration_service.get_weights()
         try:
@@ -322,6 +360,24 @@ class UPSCUpgradeTestCase(unittest.TestCase):
         self.assertIn("question", daily_question)
         self.assertIn("streak", daily_question)
         self.assertIn("reason", daily_question)
+
+    def test_study_contract_exposes_action_and_external_notes(self) -> None:
+        user_id = self._ensure_user()
+        dashboard = get_dashboard(user_id=user_id, exam_id=UPSC_EXAM_ID)
+        self.assertIn("recommended_action", dashboard["summary"])
+        self.assertIn("today_plan", dashboard["summary"])
+        self.assertIsNotNone(dashboard["summary"]["today_plan"])
+
+        topic_data = get_topic_page(user_id=user_id, topic_id=TOPIC_ID)
+        self.assertIn("next_best_action", topic_data)
+        self.assertGreaterEqual(len(topic_data["trusted_notes"]), 1)
+        self.assertGreater(topic_data["chapter_progress"]["total_subtopics"], 0)
+
+        first_subtopic_id = topic_data["topic"]["subtopics"][0]["id"]
+        notes = subtopic_notes_service.ensure_notes(subtopic_id=first_subtopic_id)
+        self.assertGreaterEqual(len(notes["external_notes"]), 1)
+        self.assertIn("directive", notes["writing_brief"])
+        self.assertGreaterEqual(len(notes["writing_brief"]["keywords"]), 1)
 
 
 if __name__ == "__main__":

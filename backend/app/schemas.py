@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# MASTER PROMPT UPDATE: Rich notes payloads and premium MCQ test contracts for the study layer.
+
 from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -56,6 +58,8 @@ class HealthData(BaseModel):
     status: Literal["ok"]
     storage_mode: Literal["local", "turso"]
     ai_mode: Literal["gemini", "demo"]
+    ai_reason: Literal["missing_key", "invalid_key"] | None = None
+    ocr_fallback: Literal["local_vision"] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -86,10 +90,19 @@ class SubjectItem(BaseModel):
     updated_at: str
 
 
+class ExternalNotePayload(BaseModel):
+    source: str
+    title: str
+    url: str
+    recommended: bool = False
+    why: str
+
+
 class SubtopicItem(BaseModel):
     id: str
     topic_id: str
     name: str
+    external_notes: list[ExternalNotePayload] = Field(default_factory=list)
     display_order: int
 
 
@@ -164,6 +177,22 @@ class ContinueTargetPayload(BaseModel):
     reason: str
 
 
+class StudyActionPayload(BaseModel):
+    type: str
+    label: str
+    href: str
+    description: str | None = None
+    cta_label: str = "Open"
+
+
+class TodayPlanPayload(BaseModel):
+    title: str
+    duration_minutes: int
+    steps: list[str] = Field(default_factory=list)
+    cta_label: str
+    href: str
+
+
 class DashboardSummaryPayload(BaseModel):
     average_score: float
     due_revisions: int
@@ -173,7 +202,10 @@ class DashboardSummaryPayload(BaseModel):
     last_score: float | None = None
     weakest_area: str | None = None
     most_repeated_mistake: str | None = None
-    recommended_action: dict[str, Any] | None = None
+    strongest_topic: str | None = None
+    weak_topics: list[str] = Field(default_factory=list)
+    recommended_action: StudyActionPayload | None = None
+    today_plan: TodayPlanPayload | None = None
 
 
 class DashboardSubjectPayload(BaseModel):
@@ -274,6 +306,8 @@ class StudyTopicData(BaseModel):
     weak_subtopics: list[dict[str, Any]] = Field(default_factory=list)
     completed_subtopics: list[str] = Field(default_factory=list)
     sections: list[dict[str, Any]] = Field(default_factory=list)
+    trusted_notes: list[ExternalNotePayload] = Field(default_factory=list)
+    next_best_action: StudyActionPayload | None = None
 
 
 class StudyTopicResponse(BaseModel):
@@ -282,15 +316,58 @@ class StudyTopicResponse(BaseModel):
     meta: EnvelopeMeta
 
 
+class RichNotesSectionPayload(BaseModel):
+    heading: str
+    paragraphs: list[str] = Field(default_factory=list)
+    bullets: list[str] = Field(default_factory=list)
+
+
+class CurrentAffairsConnectionPayload(BaseModel):
+    headline: str
+    takeaway: str
+    exam_use: str
+
+
+class RevisionTableRowPayload(BaseModel):
+    anchor: str
+    why_it_matters: str
+    exam_use: str
+
+
+class MainsWritingBlueprintPayload(BaseModel):
+    intro: list[str] = Field(default_factory=list)
+    body: list[str] = Field(default_factory=list)
+    conclusion: list[str] = Field(default_factory=list)
+    value_add: list[str] = Field(default_factory=list)
+    avoid: list[str] = Field(default_factory=list)
+
+
+class WritingBriefPayload(BaseModel):
+    directive: str
+    keywords: list[str] = Field(default_factory=list)
+    structure_hint: list[str] = Field(default_factory=list)
+
+
 class SubtopicNotesPayload(BaseModel):
     subtopic_id: str
     topic_id: str
-    quick_recall: list[str]
-    structured_answer_framework: dict[str, Any]
-    ready_answer_150: str
-    key_facts_examples: list[str]
-    value_addition: list[str]
-    diagram_flow: list[str]
+    title: str
+    summary: str
+    estimated_read_minutes: int
+    why_this_matters: list[str] = Field(default_factory=list)
+    concept_sections: list[RichNotesSectionPayload] = Field(default_factory=list)
+    upsc_exam_angle: list[str] = Field(default_factory=list)
+    pyq_linkage: list[str] = Field(default_factory=list)
+    common_mistakes: list[str] = Field(default_factory=list)
+    current_affairs_connections: list[CurrentAffairsConnectionPayload] = Field(default_factory=list)
+    mind_map_summary: list[str] = Field(default_factory=list)
+    mains_writing: MainsWritingBlueprintPayload
+    quick_revision_table: list[RevisionTableRowPayload] = Field(default_factory=list)
+    active_recall: list[str] = Field(default_factory=list)
+    mcq_bridges: list[str] = Field(default_factory=list)
+    external_notes: list[ExternalNotePayload] = Field(default_factory=list)
+    writing_brief: WritingBriefPayload
+    next_best_action: StudyActionPayload | None = None
     content_hash: str
     updated_at: str
 
@@ -298,6 +375,40 @@ class SubtopicNotesPayload(BaseModel):
 class SubtopicNotesResponse(BaseModel):
     ok: Literal[True] = True
     data: SubtopicNotesPayload
+    meta: EnvelopeMeta
+
+
+class StudyMCQTestQuestionPayload(BaseModel):
+    id: str
+    topic_id: str
+    topic_name: str
+    prompt: str
+    options: list[StudyQuestionOptionPayload]
+    difficulty: str
+    explanation_hint: str
+
+
+class StudyMCQTestContextPayload(BaseModel):
+    id: str
+    code: str
+    name: str
+
+
+class StudyMCQTestData(BaseModel):
+    scope: Literal["topic", "subject"]
+    scope_id: str
+    title: str
+    subtitle: str
+    exam: DashboardExamPayload
+    subject: StudyMCQTestContextPayload
+    duration_minutes: int
+    total_questions: int
+    questions: list[StudyMCQTestQuestionPayload]
+
+
+class StudyMCQTestResponse(BaseModel):
+    ok: Literal[True] = True
+    data: StudyMCQTestData
     meta: EnvelopeMeta
 
 
@@ -614,6 +725,94 @@ class DirectiveEvaluatorPayload(BaseModel):
     missed_demands: list[str]
 
 
+class ValueAdditionsPayload(BaseModel):
+    examples: list[str]
+    data_points: list[str]
+    reports: list[str]
+    schemes: list[str]
+    case_studies: list[str]
+
+
+class BluffFlagsPayload(BaseModel):
+    filler_phrases: list[str]
+    vague_sentences: list[str]
+    repetitions: list[str]
+    low_value_lines: list[str]
+
+
+class ConceptUniverseItemPayload(BaseModel):
+    concept: str
+    importance: Literal["core", "secondary"] = "secondary"
+
+
+class ConceptScorePayload(BaseModel):
+    concept: str
+    importance: Literal["core", "secondary"]
+    coverage_score: Literal[0, 1, 2]
+
+
+class CoreSummaryPayload(BaseModel):
+    core_total: int = Field(ge=0)
+    core_covered: int = Field(ge=0)
+    core_well_covered: int = Field(ge=0)
+
+
+class DimensionCountsPayload(BaseModel):
+    causes: int = Field(ge=0)
+    impacts: int = Field(ge=0)
+    challenges: int = Field(ge=0)
+    way_forward: int = Field(ge=0)
+    examples: int = Field(ge=0)
+
+
+class StructureSignalsPayload(BaseModel):
+    introduction: Literal["present", "weak", "missing"]
+    body: Literal["structured", "semi", "unstructured"]
+    conclusion: Literal["present", "weak", "missing"]
+
+
+class ValueAdditionCountsPayload(BaseModel):
+    data_or_report: int = Field(ge=0)
+    example: int = Field(ge=0)
+    generic: int = Field(ge=0)
+
+
+class PenaltyFlagPayload(BaseModel):
+    flag: Literal[
+        "missing_conclusion",
+        "poor_structure",
+        "weak_core_coverage",
+        "excessive_vagueness",
+        "contradiction_present",
+        "factual_error_present",
+    ]
+    severity: Literal["low", "medium", "high"]
+
+
+class UnifiedEvaluationSignalsPayload(BaseModel):
+    directive: str
+    required_components: list[str]
+    concept_scores: list[ConceptScorePayload]
+    extra_valid_concepts: list[str]
+    core_summary: CoreSummaryPayload
+    dimension_counts: DimensionCountsPayload
+    dimension_balance: Literal["poor", "average", "good"]
+    structure: StructureSignalsPayload
+    core_coverage_ratio: float = Field(ge=0, le=1)
+    core_depth_ratio: float = Field(ge=0, le=1)
+    clarity_score: int = Field(ge=0, le=5)
+    value_additions: ValueAdditionCountsPayload
+    vague_ratio: float = Field(ge=0, le=1)
+    directive_coverage_ratio: float = Field(ge=0, le=1)
+    factual_error_present: bool
+    penalty_flags: list[PenaltyFlagPayload]
+    contradiction_present: bool
+    partial_concepts_count: int = Field(ge=0)
+    answer_length_category: Literal["short", "optimal", "long"]
+    fundamental_weakness: bool
+    confidence: Literal["low", "medium", "high"]
+
+
 class LLMAnalysisPayload(BaseModel):
     relevance: Literal["FULL", "PARTIAL", "OFF_TOPIC"]
     domain: Literal["CORRECT", "WRONG"]
@@ -924,4 +1123,286 @@ class PerformanceData(BaseModel):
 class PerformanceResponse(BaseModel):
     ok: Literal[True] = True
     data: PerformanceData
+    meta: EnvelopeMeta
+
+
+# --- Focused two-feature contracts: MCQ practice + handwritten answer evaluation ---
+
+
+class TopicNormalizationPayload(BaseModel):
+    subject: str
+    core_topic: str
+    subtopics: list[str] = Field(default_factory=list)
+
+
+class MCQQuestionPayload(BaseModel):
+    id: str
+    question: str
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_option: Literal["A", "B", "C", "D"]
+    explanation: str
+    source_tag: str
+    subtopic: str
+
+
+class MCQPublicQuestionPayload(BaseModel):
+    id: str
+    question: str
+    options: list[str] = Field(min_length=4, max_length=4)
+    source_tag: str
+    subtopic: str
+
+
+class MCQStartRequest(BaseModel):
+    topic_text: str = Field(min_length=3, max_length=300)
+    question_count: int = Field(default=10, ge=5, le=30)
+
+
+class MCQStartData(BaseModel):
+    session_id: str
+    timer_seconds_per_question: int = 36
+    normalization: TopicNormalizationPayload
+    questions: list[MCQPublicQuestionPayload]
+
+
+class MCQStartResponse(BaseModel):
+    ok: Literal[True] = True
+    data: MCQStartData
+    meta: EnvelopeMeta
+
+
+class MCQSubmitAnswerPayload(BaseModel):
+    question_id: str
+    selected_option: Literal["A", "B", "C", "D"] | None = None
+
+
+class MCQSubmitRequest(BaseModel):
+    session_id: str
+    answers: list[MCQSubmitAnswerPayload]
+
+
+class MCQResultQuestionPayload(BaseModel):
+    id: str
+    question: str
+    selected_option: Literal["A", "B", "C", "D"] | None = None
+    correct_option: Literal["A", "B", "C", "D"]
+    status: Literal["correct", "wrong", "skipped"]
+    source_tag: str
+    subtopic: str
+    explanation: str
+
+
+class MCQSubmitData(BaseModel):
+    session_id: str
+    score: int
+    total_questions: int
+    accuracy_pct: float
+    attempt_pct: float
+    weak_topics: list[str]
+    retry_question_ids: list[str]
+    questions: list[MCQResultQuestionPayload]
+
+
+class MCQSubmitResponse(BaseModel):
+    ok: Literal[True] = True
+    data: MCQSubmitData
+    meta: EnvelopeMeta
+
+
+class MCQHistoryItemPayload(BaseModel):
+    session_id: str
+    raw_topic: str
+    subject: str
+    core_topic: str
+    question_count: int
+    status: str
+    score: int | None = None
+    accuracy_pct: float | None = None
+    attempt_pct: float | None = None
+    weak_topics: list[str] = Field(default_factory=list)
+    created_at: str
+    submitted_at: str | None = None
+
+
+class MCQHistoryData(BaseModel):
+    count: int
+    items: list[MCQHistoryItemPayload] = Field(default_factory=list)
+
+
+class MCQHistoryResponse(BaseModel):
+    ok: Literal[True] = True
+    data: MCQHistoryData
+    meta: EnvelopeMeta
+
+
+class PYQImportQuestionPayload(BaseModel):
+    question: str = Field(min_length=12, max_length=1200)
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_option: int | Literal["A", "B", "C", "D"]
+    explanation: str = Field(min_length=8, max_length=2000)
+    source_tag: str = Field(min_length=12, max_length=200)
+
+
+class PYQImportRequest(BaseModel):
+    topic_text: str = Field(min_length=3, max_length=300)
+    questions: list[PYQImportQuestionPayload] = Field(min_length=1, max_length=1000)
+
+
+class PYQImportIssuePayload(BaseModel):
+    row_index: int
+    reason: str
+    question: str | None = None
+
+
+class PYQImportData(BaseModel):
+    topic_normalization: TopicNormalizationPayload
+    received_count: int
+    inserted_count: int
+    skipped_count: int
+    issues: list[PYQImportIssuePayload] = Field(default_factory=list)
+
+
+class PYQImportResponse(BaseModel):
+    ok: Literal[True] = True
+    data: PYQImportData
+    meta: EnvelopeMeta
+
+
+class PYQSyncRequest(BaseModel):
+    source: Literal["upscpredict"] = "upscpredict"
+
+
+class PYQSyncPageStatPayload(BaseModel):
+    path: str
+    from_cache: bool = False
+    fetched_questions: int
+    inserted: int
+    skipped: int
+
+
+class PYQSyncIssuePayload(BaseModel):
+    page: str
+    reason: str
+    detail: str | None = None
+
+
+class PYQSyncData(BaseModel):
+    source: str
+    paths_scanned: int
+    inserted_count: int
+    skipped_count: int
+    inventory: dict[str, int]
+    pages: list[PYQSyncPageStatPayload]
+    issues: list[PYQSyncIssuePayload] = Field(default_factory=list)
+
+
+class PYQSyncResponse(BaseModel):
+    ok: Literal[True] = True
+    data: PYQSyncData
+    meta: EnvelopeMeta
+
+
+class EvaluationOCRPreviewRequest(BaseModel):
+    student_answer: str | None = Field(default=None, max_length=15000)
+    ocr_text: str | None = Field(default=None, max_length=15000)
+    handwritten_image_base64: str | None = None
+    handwritten_image_mime_type: str | None = None
+
+    @field_validator("handwritten_image_mime_type")
+    @classmethod
+    def validate_eval_preview_mime(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if value not in {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}:
+            raise ValueError("Unsupported image MIME type.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_eval_preview_input(self) -> "EvaluationOCRPreviewRequest":
+        if not any([self.student_answer, self.ocr_text, self.handwritten_image_base64]):
+            raise ValueError("Provide student_answer, ocr_text, or handwritten_image_base64.")
+        return self
+
+
+class EvaluationOCRPreviewData(BaseModel):
+    extracted_text: str
+    cleaned_text: str
+    merged_text: str
+
+
+class EvaluationOCRPreviewResponse(BaseModel):
+    ok: Literal[True] = True
+    data: EvaluationOCRPreviewData
+    meta: EnvelopeMeta
+
+
+class EvaluateStrictRequest(BaseModel):
+    question: str = Field(min_length=10, max_length=1200)
+    student_answer: str | None = Field(default=None, max_length=15000)
+    ocr_text: str | None = Field(default=None, max_length=15000)
+    handwritten_image_base64: str | None = None
+    handwritten_image_mime_type: str | None = None
+    concept_universe: list[str | ConceptUniverseItemPayload] = Field(default_factory=list)
+    max_marks: int = Field(default=10, ge=1, le=20)
+
+    @field_validator("handwritten_image_mime_type")
+    @classmethod
+    def validate_eval_mime(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if value not in {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}:
+            raise ValueError("Unsupported image MIME type.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_eval_input(self) -> "EvaluateStrictRequest":
+        if not any([self.student_answer, self.ocr_text, self.handwritten_image_base64]):
+            raise ValueError("Provide student_answer, ocr_text, or handwritten_image_base64.")
+        return self
+
+
+class EvaluationSubscoresPayload(BaseModel):
+    content_accuracy: float
+    structure: float
+    depth: float
+    keywords: float
+    conclusion: float
+
+
+class EvaluationHistoryItemPayload(BaseModel):
+    id: str
+    question_text: str
+    input_mode: str
+    score: float
+    subscores: EvaluationSubscoresPayload
+    strengths: list[str] = Field(default_factory=list)
+    missing_points: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+    created_at: str
+
+
+class EvaluationHistoryData(BaseModel):
+    count: int
+    items: list[EvaluationHistoryItemPayload] = Field(default_factory=list)
+
+
+class EvaluationHistoryResponse(BaseModel):
+    ok: Literal[True] = True
+    data: EvaluationHistoryData
+    meta: EnvelopeMeta
+
+
+class EvaluateStrictData(BaseModel):
+    evaluation: dict[str, Any]
+    analysis: dict[str, Any]
+    cleaned_answer: str
+    score: float
+    improvements: list[str]
+    model_answer: dict[str, Any]
+    subscores: EvaluationSubscoresPayload
+
+
+class EvaluateStrictResponse(BaseModel):
+    ok: Literal[True] = True
+    data: EvaluateStrictData
     meta: EnvelopeMeta

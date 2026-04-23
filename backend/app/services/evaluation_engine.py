@@ -21,6 +21,27 @@ from app.utils.common import new_id, sha256_json, sha256_text, stable_json_dumps
 
 class EvaluationEngine:
     @staticmethod
+    def _concept_universe_from_model_answer(model_answer: dict) -> list[dict[str, str]]:
+        concept_universe: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for concept in model_answer.get("core_concepts", []) or []:
+            normalized = str(concept or "").strip()
+            if normalized and normalized.lower() not in seen:
+                seen.add(normalized.lower())
+                concept_universe.append({"concept": normalized, "importance": "core"})
+        for concept in model_answer.get("must_have_points", []) or []:
+            normalized = str(concept or "").strip()
+            if normalized and normalized.lower() not in seen:
+                seen.add(normalized.lower())
+                concept_universe.append({"concept": normalized, "importance": "core"})
+        for concept in (model_answer.get("good_to_have_points", []) or []) + (model_answer.get("extra_edge_points", []) or []):
+            normalized = str(concept or "").strip()
+            if normalized and normalized.lower() not in seen:
+                seen.add(normalized.lower())
+                concept_universe.append({"concept": normalized, "importance": "secondary"})
+        return concept_universe
+
+    @staticmethod
     def _biggest_mistake(*, penalty_reasons: list[str], mistakes: list[str], top_improvements: list[str]) -> str:
         if penalty_reasons:
             return penalty_reasons[0]
@@ -118,23 +139,10 @@ class EvaluationEngine:
             )
 
         model_answer, _ = self._get_model_answer(topic=topic, question=question)
-        content_eval = llm_service.analyze_content(
+        evaluation_signals = llm_service.analyze_answer_signals(
             question=question,
             cleaned_answer=normalized["cleaned_answer"],
-            model_answer=model_answer,
-            topic=topic,
-        )
-        reasoning_eval = llm_service.analyze_reasoning(
-            question=question,
-            cleaned_answer=normalized["cleaned_answer"],
-            model_answer=model_answer,
-            topic=topic,
-        )
-        directive_eval = llm_service.analyze_directive(
-            question=question,
-            cleaned_answer=normalized["cleaned_answer"],
-            model_answer=model_answer,
-            topic=topic,
+            concept_universe=self._concept_universe_from_model_answer(model_answer),
         )
         features = scoring_engine.extract_features(
             cleaned_answer=normalized["cleaned_answer"],
@@ -144,12 +152,10 @@ class EvaluationEngine:
         similarity = similarity_engine.compare(
             student_answer=normalized["cleaned_answer"],
             model_answer=model_answer,
-            analysis=content_eval,
+            analysis={"must_have_points": evaluation_signals.get("concepts_expected", [])[:6]},
         )
-        analysis = scoring_engine.merge_analysis(
-            content=content_eval,
-            reasoning=reasoning_eval,
-            directive=directive_eval,
+        analysis = scoring_engine.merge_analysis_from_signals(
+            signals=evaluation_signals,
             features=features,
             similarity=similarity,
         )
@@ -157,6 +163,10 @@ class EvaluationEngine:
             analysis=analysis,
             similarity=similarity,
             features=features,
+            max_marks=payload["max_marks"],
+        )
+        normalized_scoring = scoring_engine.score_from_signal_strategy(
+            signals=evaluation_signals,
             max_marks=payload["max_marks"],
         )
         guidance = llm_service.generate_evaluation_guidance(
@@ -193,6 +203,15 @@ class EvaluationEngine:
 
         answer_id = new_id("ans")
         now = utc_now_iso()
+        has_image = bool(payload.get("handwritten_image_base64"))
+        has_text = bool((payload.get("student_answer") or "").strip() or (payload.get("ocr_text") or "").strip())
+        input_mode = "hybrid" if has_image and has_text else "image" if has_image else "typed"
+        raw_answer_text = (
+            normalized.get("source_text", {}).get("merged_text")
+            or payload.get("student_answer")
+            or payload.get("ocr_text")
+            or ""
+        )
         db.execute(
             """
             INSERT INTO answers
@@ -204,10 +223,10 @@ class EvaluationEngine:
                 user_id,
                 topic["id"],
                 question,
-                payload.get("student_answer") or payload.get("ocr_text") or "",
+                raw_answer_text,
                 normalized["cleaned_answer"],
                 stable_json_dumps(normalized["sentence_list"]),
-                "image" if payload.get("handwritten_image_base64") else "text",
+                input_mode,
                 payload.get("ocr_text"),
                 payload["max_marks"],
                 sha256_text(f"{question}|{normalized['cleaned_answer']}"),
@@ -218,9 +237,8 @@ class EvaluationEngine:
         evaluation_history_id = new_id("evalh")
         stored_analysis = {
             "analysis": analysis,
-            "content_evaluator": content_eval,
-            "reasoning_evaluator": reasoning_eval,
-            "directive_evaluator": directive_eval,
+            "evaluation_signals": evaluation_signals,
+            "normalized_scoring": normalized_scoring,
         }
         db.execute(
             """
@@ -345,6 +363,7 @@ class EvaluationEngine:
                 "mistakes": mistakes,
                 "ideal_answer": model_answer,
                 "confidence": scoring["confidence"],
+                "normalized_scoring": normalized_scoring,
                 "maturity": features["maturity"]["level"],
                 "bluff_ratio": features["bluff_ratio"],
                 "coverage_score": similarity["coverage_score"],
@@ -380,6 +399,7 @@ class EvaluationEngine:
             "similarity": similarity,
             "features": features,
             "scoring": scoring,
+            "normalized_scoring": normalized_scoring,
         }
 
 
